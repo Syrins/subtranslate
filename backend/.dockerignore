@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+tmp/
+storage/
+test.py
+*.log
+.git/
+.gitignore
+celerybeat-schedule*
+*.db
+README.md

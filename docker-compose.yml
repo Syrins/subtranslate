@@ -1,0 +1,115 @@
+services:
+  # ─── Redis ───────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── Backend API ─────────────────────────────────────
+  backend:
+    build: ./backend
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL:?}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
+      - REDIS_URL=redis://redis:6379/0
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_ENDPOINT=${R2_ENDPOINT:-}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME:-subtranslate}
+      - R2_CDN_DOMAIN=${R2_CDN_DOMAIN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DEEPL_API_KEY=${DEEPL_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:?}
+      - DEBUG=${DEBUG:-false}
+      - STORAGE_DIR=/app/storage
+      - TEMP_DIR=/app/tmp
+    volumes:
+      - backend_storage:/app/storage
+      - backend_tmp:/app/tmp
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ─── Celery Worker ───────────────────────────────────
+  celery-worker:
+    build: ./backend
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL:?}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
+      - REDIS_URL=redis://redis:6379/0
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_ENDPOINT=${R2_ENDPOINT:-}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME:-subtranslate}
+      - R2_CDN_DOMAIN=${R2_CDN_DOMAIN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DEEPL_API_KEY=${DEEPL_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - STORAGE_DIR=/app/storage
+      - TEMP_DIR=/app/tmp
+    volumes:
+      - backend_storage:/app/storage
+      - backend_tmp:/app/tmp
+    depends_on:
+      redis:
+        condition: service_healthy
+    exclude_from_hc: true
+    restart: unless-stopped
+
+  # ─── Celery Beat (scheduler) ─────────────────────────
+  celery-beat:
+    build: ./backend
+    command: celery -A app.workers.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL:?}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
+      - REDIS_URL=redis://redis:6379/0
+      - STORAGE_DIR=/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    exclude_from_hc: true
+    restart: unless-stopped
+
+  # ─── Frontend ────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL:?}
+        - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY:?}
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:?}
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  backend_storage:
+  backend_tmp:
