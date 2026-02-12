@@ -1,0 +1,31 @@
+{
+  "name": "subtranslate",
+  "version": "1.0.0",
+  "description": "Web-based subtitle translation and high-quality video export platform",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "build": "npm run build --workspace=backend && npm run build --workspace=frontend",
+    "build:backend": "npm run build --workspace=backend",
+    "build:frontend": "npm run build --workspace=frontend"
+  },
+  "keywords": [
+    "subtitle",
+    "translation",
+    "video",
+    "mkv",
+    "srt",
+    "ass"
+  ],
+  "author": "Syrins",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

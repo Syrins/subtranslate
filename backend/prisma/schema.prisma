@@ -1,0 +1,113 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String
+  name          String?
+  planId        String    @default("free")
+  storageType   String?   // "r2" or "b2"
+  storageConfig Json?     // Storage credentials
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  projects      Project[]
+  jobs          Job[]
+  
+  @@map("users")
+}
+
+model Project {
+  id              String    @id @default(uuid())
+  userId          String
+  name            String
+  sourceVideoUrl  String?   // Presigned URL or uploaded file path
+  sourceVideoType String?   // "upload" or "link"
+  status          String    @default("created") // created, processing, completed, failed
+  retentionDays   Int       @default(30)
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subtitles       Subtitle[]
+  jobs            Job[]
+  
+  @@map("projects")
+}
+
+model Subtitle {
+  id            String    @id @default(uuid())
+  projectId     String
+  language      String
+  format        String    // "srt" or "ass"
+  content       String    @db.Text
+  isOriginal    Boolean   @default(false)
+  translatedFrom String?
+  translationService String? // "openai", "deepl", or "gemini"
+  
+  // Styling options (for ASS format)
+  fontFamily    String?
+  fontSize      Int?
+  fontColor     String?
+  outlineColor  String?
+  outlineWidth  Float?
+  positionX     Float?
+  positionY     Float?
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  @@map("subtitles")
+}
+
+model Job {
+  id            String    @id @default(uuid())
+  userId        String
+  projectId     String?
+  type          String    // "extract", "translate", "export"
+  status        String    @default("pending") // pending, processing, completed, failed
+  progress      Int       @default(0)
+  
+  // Job configuration
+  config        Json?
+  
+  // Result
+  resultUrl     String?
+  error         String?   @db.Text
+  
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project       Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  @@map("jobs")
+}
+
+model Plan {
+  id                String   @id
+  name              String
+  maxProjects       Int
+  maxVideoSizeMB    Int
+  retentionDays     Int
+  allowWatermark    Boolean
+  allowMultiAudio   Boolean
+  translationQuota  Int      // translations per month
+  
+  @@map("plans")
+}
