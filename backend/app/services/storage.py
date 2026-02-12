@@ -21,6 +21,7 @@ class LocalStorage:
     def __init__(self):
         self.root = STORAGE_DIR
         self.root.mkdir(parents=True, exist_ok=True)
+        self._root_resolved = self.root.resolve()
         # Keep these for health check compatibility
         self.access_key = "local"
         self.secret_key = "local"
@@ -30,7 +31,9 @@ class LocalStorage:
     def _resolve(self, key: str) -> Path:
         """Resolve a storage key to a local file path (with path traversal protection)."""
         path = (self.root / key).resolve()
-        if not str(path).startswith(str(self.root.resolve())):
+        try:
+            path.relative_to(self._root_resolved)
+        except ValueError:
             raise ValueError(f"Path traversal detected: {key}")
         return path
 

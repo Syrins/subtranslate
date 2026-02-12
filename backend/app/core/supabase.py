@@ -146,9 +146,13 @@ class SupabaseTable:
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        # single/maybeSingle: return None data instead of raising on 406
+        # single/maybeSingle: allow "not found" but do not hide multi-row data anomalies
         if resp.status_code == 406 and (getattr(self, "_maybe_single", False) or getattr(self, "_single", False)):
-            return SupabaseResponse(data=None, count=0)
+            body_lower = (resp.text or "").lower()
+            if "contains 0 rows" in body_lower or "result contains 0 rows" in body_lower:
+                return SupabaseResponse(data=None, count=0)
+            mode = "maybeSingle" if getattr(self, "_maybe_single", False) else "single"
+            raise RuntimeError(f"Supabase {mode} expected a single row but got multiple rows: {resp.text[:300]}")
 
         if resp.status_code >= 400:
             raise RuntimeError(f"Supabase error {resp.status_code}: {resp.text[:300]}")

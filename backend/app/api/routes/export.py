@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 import shutil
 import uuid
-import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import structlog
@@ -11,9 +10,8 @@ from app.core.supabase import get_supabase_admin
 from app.core.config import get_settings
 from app.models.schemas import ExportJobCreate
 from app.utils.ffmpeg import burn_subtitles, mux_subtitles
-from app.services.subtitle_parser import write_srt, write_ass
 from app.services.storage import get_r2_storage
-from app.services.cleanup import ensure_storage_for_upload, mark_uploaded_to_user_storage
+from app.services.cleanup import mark_uploaded_to_user_storage
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/export", tags=["Export"])
@@ -69,10 +67,9 @@ def create_export_job(
 
     sb.table("projects").update({"status": "exporting"}).eq("id", body.project_id).execute()
 
-    # Run export in a separate thread so it doesn't block the event loop
-    t = threading.Thread(
-        target=_run_export,
-        kwargs=dict(
+    try:
+        from app.workers.tasks import run_export_task
+        run_export_task.delay(
             job_id=job_id,
             project_id=body.project_id,
             user_id=user["id"],
@@ -82,10 +79,15 @@ def create_export_job(
             audio_codec=body.audio_codec,
             watermark_text=body.watermark_text if body.include_watermark else None,
             subtitle_style=body.subtitle_style,
-        ),
-        daemon=True,
-    )
-    t.start()
+        )
+    except Exception as e:
+        logger.error("export_enqueue_failed", job_id=job_id, error=str(e))
+        sb.table("export_jobs").update({
+            "status": "failed",
+            "error_message": "Queue dispatch failed",
+        }).eq("id", job_id).execute()
+        sb.table("projects").update({"status": "translated"}).eq("id", body.project_id).execute()
+        raise HTTPException(status_code=500, detail="Export job could not be queued")
 
     return {"id": job_id, "status": "queued"}
 
@@ -129,6 +131,7 @@ def cancel_export_job(job_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Job cannot be cancelled")
 
     sb.table("export_jobs").update({"status": "cancelled"}).eq("id", job_id).execute()
+    sb.table("projects").update({"status": "translated"}).eq("id", job.data["project_id"]).execute()
     return {"status": "cancelled"}
 
 
@@ -220,6 +223,7 @@ def _run_export(
         job_check = sb.table("export_jobs").select("status").eq("id", job_id).single().execute()
         if job_check.data and job_check.data["status"] == "cancelled":
             logger.info("export_cancelled_before_encode", job_id=job_id)
+            sb.table("projects").update({"status": "translated"}).eq("id", project_id).execute()
             return
 
         # Export based on mode
@@ -250,6 +254,12 @@ def _run_export(
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         output_size = output_path.stat().st_size
+
+        job_check = sb.table("export_jobs").select("status").eq("id", job_id).single().execute()
+        if job_check.data and job_check.data["status"] == "cancelled":
+            logger.info("export_cancelled_after_encode", job_id=job_id)
+            sb.table("projects").update({"status": "translated"}).eq("id", project_id).execute()
+            return
 
         sb.table("export_jobs").update({"progress": 90}).eq("id", job_id).execute()
 

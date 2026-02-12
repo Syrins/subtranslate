@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import structlog
 
 from app.core.security import require_admin
@@ -137,7 +136,16 @@ def admin_cancel_job(job_id: str, job_type: str = Query("translation")):
     """Admin cancel any job."""
     sb = get_supabase_admin()
     table = "translation_jobs" if job_type == "translation" else "export_jobs"
-    sb.table(table).update({"status": "cancelled"}).eq("id", job_id).in_("status", ["queued", "processing"]).execute()
+
+    job = sb.table(table).select("id, project_id, status").eq("id", job_id).single().execute()
+    if not job.data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.data["status"] not in ("queued", "processing"):
+        raise HTTPException(status_code=400, detail="Job cannot be cancelled")
+
+    sb.table(table).update({"status": "cancelled"}).eq("id", job_id).execute()
+    project_status = "ready" if job_type == "translation" else "translated"
+    sb.table("projects").update({"status": project_status}).eq("id", job.data["project_id"]).execute()
     return {"status": "cancelled"}
 
 
@@ -152,48 +160,55 @@ def admin_retry_job(job_id: str, job_type: str = Query("translation")):
         raise HTTPException(status_code=404, detail="Failed job not found")
 
     sb.table(table).update({"status": "queued", "progress": 0, "error_message": None}).eq("id", job_id).execute()
+    project_status = "translating" if job_type == "translation" else "exporting"
+    sb.table("projects").update({"status": project_status}).eq("id", job.data["project_id"]).execute()
 
     # Re-launch the background task
     if job_type == "translation":
-        from app.api.routes.translate import _run_translation, _get_api_key
+        from app.api.routes.translate import _get_api_key
+        from app.workers.tasks import run_translation_task
         jd = job.data
         profile = sb.table("profiles").select("plan_id").eq("id", jd["user_id"]).single().execute()
         plan_id = profile.data.get("plan_id", "free") if profile.data else "free"
-        # Find subtitle_file_id from subtitle_files
-        sf = sb.table("subtitle_files").select("id").eq("project_id", jd["project_id"]).limit(1).execute()
-        subtitle_file_id = sf.data[0]["id"] if sf.data else None
+        subtitle_file_id = jd.get("subtitle_file_id")
+        if not subtitle_file_id:
+            sf_query = sb.table("subtitle_files").select("id").eq("project_id", jd["project_id"])
+            if jd.get("source_lang"):
+                sf_query = sf_query.eq("language", jd["source_lang"])
+            sf = sf_query.order("track_index").limit(1).execute()
+            subtitle_file_id = sf.data[0]["id"] if sf.data else None
+        if not subtitle_file_id:
+            raise HTTPException(status_code=400, detail="Subtitle file not found for retry")
+
         api_key = _get_api_key(sb, jd["user_id"], jd["engine"], plan_id)
         if not api_key:
             raise HTTPException(status_code=400, detail="API key not found for retry")
-        t = threading.Thread(
-            target=_run_translation,
-            kwargs=dict(
-                job_id=job_id, project_id=jd["project_id"], user_id=jd["user_id"],
-                engine_id=jd["engine"], api_key=api_key,
-                source_lang=jd["source_lang"], target_lang=jd["target_lang"],
-                context_enabled=jd.get("context_enabled", True),
-                glossary_enabled=jd.get("glossary_enabled", False),
-                subtitle_file_id=subtitle_file_id,
-            ),
-            daemon=True,
+        run_translation_task.delay(
+            job_id=job_id,
+            project_id=jd["project_id"],
+            user_id=jd["user_id"],
+            engine_id=jd["engine"],
+            api_key=api_key,
+            source_lang=jd["source_lang"],
+            target_lang=jd["target_lang"],
+            context_enabled=jd.get("context_enabled", True),
+            glossary_enabled=jd.get("glossary_enabled", False),
+            subtitle_file_id=subtitle_file_id,
         )
-        t.start()
     else:
-        from app.api.routes.export import _run_export
+        from app.workers.tasks import run_export_task
         jd = job.data
-        t = threading.Thread(
-            target=_run_export,
-            kwargs=dict(
-                job_id=job_id, project_id=jd["project_id"], user_id=jd["user_id"],
-                mode=jd["mode"], resolution=jd.get("resolution", "original"),
-                video_codec=jd.get("video_codec", "h264"),
-                audio_codec=jd.get("audio_codec", "aac"),
-                watermark_text=jd.get("watermark_text"),
-                subtitle_style=jd.get("subtitle_style"),
-            ),
-            daemon=True,
+        run_export_task.delay(
+            job_id=job_id,
+            project_id=jd["project_id"],
+            user_id=jd["user_id"],
+            mode=jd["mode"],
+            resolution=jd.get("resolution", "original"),
+            video_codec=jd.get("video_codec", "h264"),
+            audio_codec=jd.get("audio_codec", "aac"),
+            watermark_text=jd.get("watermark_text"),
+            subtitle_style=jd.get("subtitle_style"),
         )
-        t.start()
 
     return {"status": "queued", "message": "Job re-launched"}
 
@@ -321,7 +336,7 @@ def list_stored_files(
 ):
     """List stored files with filters."""
     sb = get_supabase_admin()
-    query = sb.table("stored_files").select("*, profiles(full_name, plan_id)")
+    query = sb.table("stored_files").select("*, profiles(full_name, plan_id)", count="exact")
 
     if user_id:
         query = query.eq("user_id", user_id)
@@ -329,7 +344,7 @@ def list_stored_files(
         query = query.eq("file_type", file_type)
 
     result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-    return {"data": result.data or [], "total": len(result.data or [])}
+    return {"data": result.data or [], "total": result.count or 0}
 
 
 @router.delete("/storage/files/{file_id}")

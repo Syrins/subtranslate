@@ -7,6 +7,19 @@ from app.core.supabase import get_supabase_admin
 from app.services.storage import get_r2_storage
 
 logger = structlog.get_logger()
+ACTIVE_PROJECT_STATUSES = {"processing", "translating", "exporting"}
+
+
+def _project_is_active(sb, project_id: str | None) -> bool:
+    """Return True if a project is currently in an active processing state."""
+    if not project_id:
+        return False
+    try:
+        project = sb.table("projects").select("status").eq("id", project_id).maybeSingle().execute()
+    except Exception:
+        return False
+    status = (project.data or {}).get("status")
+    return status in ACTIVE_PROJECT_STATUSES
 
 
 def cleanup_expired_files():
@@ -25,6 +38,8 @@ def cleanup_expired_files():
     freed_bytes = 0
 
     for file in expired.data:
+        if _project_is_active(sb, file.get("project_id")):
+            continue
         try:
             storage.delete(file["storage_path"])
             sb.table("stored_files").delete().eq("id", file["id"]).execute()
@@ -109,6 +124,8 @@ def check_storage_limit(user_id: str) -> dict:
     for file in (files.data or []):
         if used_bytes - freed < max_bytes:
             break
+        if _project_is_active(sb, file.get("project_id")):
+            continue
         try:
             storage.delete(file["storage_path"])
             sb.table("stored_files").delete().eq("id", file["id"]).execute()
@@ -173,6 +190,8 @@ def ensure_storage_for_upload(user_id: str, needed_bytes: int) -> dict:
     for file in (files.data or []):
         if freed >= need_to_free:
             break
+        if _project_is_active(sb, file.get("project_id")):
+            continue
         try:
             storage.delete(file["storage_path"])
             sb.table("stored_files").delete().eq("id", file["id"]).execute()

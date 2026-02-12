@@ -99,6 +99,7 @@ def run_translation_task(
         for chunk_idx, chunk in enumerate(chunks):
             job_check = sb.table("translation_jobs").select("status").eq("id", job_id).single().execute()
             if job_check.data and job_check.data["status"] == "cancelled":
+                sb.table("projects").update({"status": "ready"}).eq("id", project_id).execute()
                 return {"status": "cancelled"}
 
             texts = [line["original_text"] for line in chunk]
@@ -238,6 +239,7 @@ def run_export_task(
         job_check = sb.table("export_jobs").select("status").eq("id", job_id).single().execute()
         if job_check.data and job_check.data["status"] == "cancelled":
             logger.info("export_cancelled_before_encode", job_id=job_id)
+            sb.table("projects").update({"status": "translated"}).eq("id", project_id).execute()
             return {"status": "cancelled"}
 
         output_ext = ".mp4" if mode == "burn_in" else source_ext
@@ -266,6 +268,12 @@ def run_export_task(
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         output_size = output_path.stat().st_size
+
+        job_check = sb.table("export_jobs").select("status").eq("id", job_id).single().execute()
+        if job_check.data and job_check.data["status"] == "cancelled":
+            logger.info("export_cancelled_after_encode", job_id=job_id)
+            sb.table("projects").update({"status": "translated"}).eq("id", project_id).execute()
+            return {"status": "cancelled"}
 
         sb.table("export_jobs").update({"progress": 90}).eq("id", job_id).execute()
 
@@ -318,6 +326,28 @@ def run_export_task(
         raise self.retry(exc=e)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@celery_app.task
+def run_project_processing_task(
+    project_id: str,
+    user_id: str,
+    local_path: str,
+    work_dir: str,
+    ext: str,
+    plan_data: dict,
+):
+    """Celery task: process uploaded source video and extract subtitle tracks."""
+    from app.api.routes.projects import _process_video_project
+    _process_video_project(
+        project_id=project_id,
+        user_id=user_id,
+        local_path=local_path,
+        work_dir=work_dir,
+        ext=ext,
+        plan_data=plan_data,
+    )
+    return {"status": "processed", "project_id": project_id}
 
 
 @celery_app.task

@@ -3,7 +3,6 @@ import structlog
 import uuid
 import time
 import asyncio
-import threading
 import tempfile
 import re
 from pathlib import Path
@@ -12,7 +11,7 @@ from datetime import datetime, timezone
 from app.core.security import get_current_user
 from app.core.supabase import get_supabase_admin
 from app.core.config import get_settings
-from app.models.schemas import TranslationJobCreate, JobStatus
+from app.models.schemas import TranslationJobCreate
 from app.services.translation import get_engine
 from app.services.subtitle_parser import parse_subtitle_file, write_srt
 from app.services.storage import get_r2_storage
@@ -102,9 +101,9 @@ def create_translation_job(
 
     sb.table("projects").update({"status": "translating"}).eq("id", body.project_id).execute()
 
-    t = threading.Thread(
-        target=_run_translation,
-        kwargs=dict(
+    try:
+        from app.workers.tasks import run_translation_task
+        run_translation_task.delay(
             job_id=job_id,
             project_id=body.project_id,
             user_id=user["id"],
@@ -115,10 +114,15 @@ def create_translation_job(
             context_enabled=body.context_enabled,
             glossary_enabled=body.glossary_enabled,
             subtitle_file_id=body.subtitle_file_id,
-        ),
-        daemon=True,
-    )
-    t.start()
+        )
+    except Exception as e:
+        logger.error("translation_enqueue_failed", job_id=job_id, error=str(e))
+        sb.table("translation_jobs").update({
+            "status": "failed",
+            "error_message": "Queue dispatch failed",
+        }).eq("id", job_id).execute()
+        sb.table("projects").update({"status": "ready"}).eq("id", body.project_id).execute()
+        raise HTTPException(status_code=500, detail="Translation job could not be queued")
 
     return {"id": job_id, "status": "queued", "total_lines": total_lines}
 
@@ -144,6 +148,7 @@ def cancel_translation_job(job_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Job cannot be cancelled")
 
     sb.table("translation_jobs").update({"status": "cancelled"}).eq("id", job_id).execute()
+    sb.table("projects").update({"status": "ready"}).eq("id", job.data["project_id"]).execute()
     return {"status": "cancelled"}
 
 
@@ -293,6 +298,7 @@ def _run_translation(
             job_check = sb.table("translation_jobs").select("status").eq("id", job_id).single().execute()
             if job_check.data and job_check.data["status"] == "cancelled":
                 logger.info("translation_cancelled", job_id=job_id)
+                sb.table("projects").update({"status": "ready"}).eq("id", project_id).execute()
                 return
 
             texts = [line["original_text"] for line in chunk]

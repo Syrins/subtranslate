@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, s
 from typing import Optional
 import shutil
 import uuid
-import threading
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -156,20 +155,22 @@ def create_project(
     # --- 6. Increment daily job counter ---
     sb.rpc("increment_daily_jobs", {"user_id_param": user["id"]})
 
-    # --- 7. Run heavy processing in a separate thread (non-blocking) ---
-    t = threading.Thread(
-        target=_process_video_project,
-        kwargs=dict(
+    # --- 7. Queue heavy processing in Celery (non-blocking + durable) ---
+    try:
+        from app.workers.tasks import run_project_processing_task
+        run_project_processing_task.delay(
             project_id=project_id,
             user_id=user["id"],
             local_path=str(local_path),
             work_dir=str(work_dir),
             ext=ext,
             plan_data=plan_data,
-        ),
-        daemon=True,
-    )
-    t.start()
+        )
+    except Exception as e:
+        logger.error("project_processing_enqueue_failed", project_id=project_id, error=str(e))
+        sb.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="Project processing could not be queued")
 
     logger.info("project_upload_accepted", project_id=project_id, size=actual_size)
 

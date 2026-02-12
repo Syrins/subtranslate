@@ -94,14 +94,14 @@ def create_app() -> FastAPI:
     @app.get("/files/{file_path:path}")
     def serve_file(file_path: str, request: Request):
         """Serve files from local storage directory with HTTP Range support."""
-        full_path = STORAGE_DIR / file_path
-        if not full_path.exists() or not full_path.is_file():
-            raise HTTPException(status_code=404, detail="File not found")
+        full_path = (STORAGE_DIR / file_path).resolve()
         # Security: ensure path is within STORAGE_DIR
         try:
-            full_path.resolve().relative_to(STORAGE_DIR.resolve())
+            full_path.relative_to(STORAGE_DIR.resolve())
         except ValueError:
             raise HTTPException(status_code=403, detail="Access denied")
+        if not full_path.exists() or not full_path.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
 
         file_size = full_path.stat().st_size
         content_type, _ = _mimetypes.guess_type(str(full_path))
