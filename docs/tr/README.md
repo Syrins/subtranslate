@@ -18,6 +18,7 @@ Bu dokumantasyon seti; backend, frontend, engine ve deploy konularini Turkce ola
 - Frontend: [frontend/README.md](frontend/README.md)
 - Engine: [engine/README.md](engine/README.md)
 - Deploy (Coolify): [deploy/README.md](deploy/README.md)
+- **🔧 Hata Giderme**: [HATA_GIDERME.md](HATA_GIDERME.md)
 
 ## Ust Seviye Linkler
 
