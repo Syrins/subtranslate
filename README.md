@@ -14,9 +14,11 @@ SubTranslate, altyazi cevirisi ve video export icin gelistirilmis full-stack bir
 
 ## Documentation
 
-- Docs Hub: [docs/README.md](docs/README.md)
-- Turkish Docs Index: [docs/tr/README.md](docs/tr/README.md)
-- English Docs Index: [docs/en/README.md](docs/en/README.md)
+- 📚 Docs Hub: [docs/README.md](docs/README.md)
+- 🇹🇷 Turkish Docs Index: [docs/tr/README.md](docs/tr/README.md)
+- 🇬🇧 English Docs Index: [docs/en/README.md](docs/en/README.md)
+- 🔧 **Troubleshooting Guide**: [docs/en/TROUBLESHOOTING.md](docs/en/TROUBLESHOOTING.md)
+- 🔧 **Troubleshooting Guide**: [docs/tr/HATA_GIDERME.md](docs/tr/HATA_GIDERME.md)
 
 ### Turkish Sections
 
