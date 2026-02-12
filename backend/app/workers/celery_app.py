@@ -27,21 +27,14 @@ celery_app.conf.update(
     broker_connection_retry=True,
     broker_connection_max_retries=None,
     broker_heartbeat=30,
-    broker_pool_limit=1,
+    broker_pool_limit=10,
     broker_transport_options={
-        "socket_keepalive": True,
-        "socket_keepalive_options": {
-            1: 60,   # TCP_KEEPIDLE  - start keepalive after 60s idle
-            2: 15,   # TCP_KEEPINTVL - send keepalive every 15s
-            3: 5,    # TCP_KEEPCNT   - drop after 5 failed probes
-        },
         "health_check_interval": 30,
         "retry_on_timeout": True,
         "socket_connect_timeout": 10,
         "socket_timeout": 120,
     },
     result_backend_transport_options={
-        "socket_keepalive": True,
         "health_check_interval": 30,
         "retry_on_timeout": True,
     },
