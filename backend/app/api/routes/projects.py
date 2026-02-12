@@ -21,6 +21,31 @@ logger = structlog.get_logger()
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
 
+def _save_upload_file(upload: UploadFile, dest: Path, max_bytes: int) -> int:
+    """Stream an UploadFile to disk with a hard size limit. Returns written bytes."""
+    written = 0
+    chunk_size = 1024 * 1024  # 1MB
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = upload.file.read(chunk_size)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Dosya çok büyük. Maksimum {max_bytes // (1024 * 1024)}MB",
+                    )
+                out.write(chunk)
+    finally:
+        try:
+            upload.file.close()
+        except Exception:
+            pass
+    return written
+
+
 @router.get("")
 def list_projects(user: dict = Depends(get_current_user)):
     """List all projects for the current user."""
@@ -78,37 +103,40 @@ def create_project(
         )
 
     # --- 2. Validate file ---
-    if file.size and file.size > settings.max_upload_bytes:
-        raise HTTPException(status_code=413, detail=f"Dosya çok büyük. Maksimum {settings.max_upload_size_mb}MB")
-
     allowed = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".ts", ".flv"}
     ext = Path(file.filename or "file.mkv").suffix.lower()
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Desteklenmeyen dosya türü: {ext}")
 
-    # --- 3. Check storage limit ---
-    file_size_estimate = file.size or 0
-    storage_check = ensure_storage_for_upload(user["id"], file_size_estimate)
-    if not storage_check["ok"]:
-        raise HTTPException(
-            status_code=507,
-            detail="Depolama alanı yetersiz. Eski dosyalarınızı silmenize rağmen yeterli alan açılamadı."
-        )
-
-    # --- 4. Save file locally ---
+    # --- 3. Save file locally (stream + size limit) ---
     project_id = str(uuid.uuid4())
     work_dir = settings.temp_path / project_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
     local_path = work_dir / f"source{ext}"
     try:
-        with open(local_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        _save_upload_file(file, local_path, settings.max_upload_bytes)
+    except HTTPException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {str(e)}")
 
     actual_size = local_path.stat().st_size
+
+    # --- 4. Check storage limit (after we know real size) ---
+    storage_check = ensure_storage_for_upload(user["id"], actual_size)
+    if not storage_check["ok"]:
+        try:
+            local_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=507,
+            detail="Depolama alanı yetersiz. Eski dosyalarınızı silmenize rağmen yeterli alan açılamadı."
+        )
 
     # --- 5. Create project record immediately (status=processing) ---
     project_data = {
@@ -341,10 +369,13 @@ def get_project_subtitles(
         # Read file from local storage and parse
         try:
             file_data = r2.download(file_url)
-            tmp = Path(tempfile.mktemp(suffix=f".{sf['format']}"))
-            tmp.write_bytes(file_data)
-            lines = parse_subtitle_file(str(tmp))
-            tmp.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sf['format']}") as tf:
+                tmp = Path(tf.name)
+                tf.write(file_data)
+            try:
+                lines = parse_subtitle_file(str(tmp))
+            finally:
+                tmp.unlink(missing_ok=True)
 
             # Check if translated version exists
             translated_url = sf.get("translated_file_url")
@@ -352,10 +383,13 @@ def get_project_subtitles(
             if translated_url:
                 try:
                     tr_data = r2.download(translated_url)
-                    tr_tmp = Path(tempfile.mktemp(suffix=f".{sf['format']}"))
-                    tr_tmp.write_bytes(tr_data)
-                    tr_parsed = parse_subtitle_file(str(tr_tmp))
-                    tr_tmp.unlink(missing_ok=True)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sf['format']}") as tf:
+                        tr_tmp = Path(tf.name)
+                        tf.write(tr_data)
+                    try:
+                        tr_parsed = parse_subtitle_file(str(tr_tmp))
+                    finally:
+                        tr_tmp.unlink(missing_ok=True)
                     translated_lines = {l["line_number"]: l["original_text"] for l in tr_parsed}
                 except Exception:
                     pass
@@ -437,10 +471,13 @@ def batch_update_subtitles(
 
         try:
             file_data = r2.download(file_url)
-            tmp = Path(tempfile.mktemp(suffix=f".{sub_file.data['format']}"))
-            tmp.write_bytes(file_data)
-            original_lines = parse_subtitle_file(str(tmp))
-            tmp.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sub_file.data['format']}") as tf:
+                tmp = Path(tf.name)
+                tf.write(file_data)
+            try:
+                original_lines = parse_subtitle_file(str(tmp))
+            finally:
+                tmp.unlink(missing_ok=True)
         except Exception as e:
             logger.error("batch_update_read_original_failed", sf_id=sf_id, file_url=file_url, error=str(e))
             continue
@@ -451,10 +488,13 @@ def batch_update_subtitles(
         if translated_url:
             try:
                 tr_data = r2.download(translated_url)
-                tr_tmp = Path(tempfile.mktemp(suffix=".srt"))
-                tr_tmp.write_bytes(tr_data)
-                tr_parsed = parse_subtitle_file(str(tr_tmp))
-                tr_tmp.unlink(missing_ok=True)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+                    tr_tmp = Path(tf.name)
+                    tf.write(tr_data)
+                try:
+                    tr_parsed = parse_subtitle_file(str(tr_tmp))
+                finally:
+                    tr_tmp.unlink(missing_ok=True)
                 existing_translations = {l["line_number"]: l["original_text"] for l in tr_parsed}
             except Exception as e:
                 logger.warning("batch_update_read_translated_failed", sf_id=sf_id, error=str(e))
@@ -475,7 +515,8 @@ def batch_update_subtitles(
 
         # Write and save
         try:
-            tmp_out = Path(tempfile.mktemp(suffix=".srt"))
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+                tmp_out = Path(tf.name)
             write_srt(out_lines, str(tmp_out), use_translated=False)
 
             translated_key = r2.get_storage_key(
@@ -541,14 +582,21 @@ def create_subtitle_project(
 
     local_path = work_dir / f"subtitle{ext}"
     try:
-        with open(local_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        _save_upload_file(file, local_path, settings.max_upload_bytes)
+    except HTTPException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {str(e)}")
 
     try:
         actual_size = local_path.stat().st_size
+
+        # --- 3.5. Check storage limit (after we know real size) ---
+        storage_check = ensure_storage_for_upload(user["id"], actual_size)
+        if not storage_check["ok"]:
+            raise HTTPException(status_code=507, detail="Depolama alanı yetersiz.")
 
         # --- 4. Parse subtitle ---
         lines = parse_subtitle_file(str(local_path))

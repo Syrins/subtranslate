@@ -287,7 +287,7 @@ def _run_export(
             "output_file_url": storage_key,
             "output_file_size_bytes": output_size,
             "duration_ms": elapsed_ms,
-            "completed_at": "now()",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         sb.table("projects").update({"status": "exported"}).eq("id", project_id).execute()

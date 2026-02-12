@@ -12,7 +12,7 @@ router = APIRouter(tags=["Health"])
 @router.get("/health")
 def health_check():
     """System health check endpoint (sync — all checks are sync I/O)."""
-    checks = {"status": "ok", "version": "1.0.0", "ffmpeg": False, "redis": False, "supabase": False, "r2": False}
+    checks = {"status": "ok", "version": "1.0.0", "ffmpeg": False, "redis": False, "supabase": False, "storage": False}
 
     # FFmpeg + FFprobe check
     try:
@@ -41,9 +41,9 @@ def health_check():
         checks["supabase"] = False
 
     # Local Storage check
-    checks["r2"] = STORAGE_DIR.exists() and STORAGE_DIR.is_dir()
+    checks["storage"] = STORAGE_DIR.exists() and STORAGE_DIR.is_dir()
 
-    if not all([checks["ffmpeg"], checks["supabase"], checks["r2"]]):
+    if not all([checks["ffmpeg"], checks["supabase"], checks["storage"]]):
         checks["status"] = "degraded"
 
     return checks

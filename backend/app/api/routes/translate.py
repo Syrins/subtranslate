@@ -7,6 +7,7 @@ import threading
 import tempfile
 import re
 from pathlib import Path
+from datetime import datetime, timezone
 
 from app.core.security import get_current_user
 from app.core.supabase import get_supabase_admin
@@ -51,10 +52,13 @@ def create_translation_job(
 
     # Read and parse the subtitle file to get line count
     file_data = storage.download(sub_file.data["file_url"])
-    tmp = Path(tempfile.mktemp(suffix=f".{sub_file.data['format']}"))
-    tmp.write_bytes(file_data)
-    lines = parse_subtitle_file(str(tmp))
-    tmp.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sub_file.data['format']}") as tf:
+        tmp = Path(tf.name)
+        tf.write(file_data)
+    try:
+        lines = parse_subtitle_file(str(tmp))
+    finally:
+        tmp.unlink(missing_ok=True)
     total_lines = len(lines)
 
     if total_lines == 0:
@@ -239,7 +243,7 @@ def _run_translation(
     try:
         sb.table("translation_jobs").update({
             "status": "processing",
-            "started_at": "now()",
+            "started_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         # --- 1. Read subtitle file from local storage ---
@@ -248,10 +252,13 @@ def _run_translation(
             raise RuntimeError("Subtitle file not found in storage")
 
         file_data = storage.download(sub_file.data["file_url"])
-        tmp_src = Path(tempfile.mktemp(suffix=f".{sub_file.data['format']}"))
-        tmp_src.write_bytes(file_data)
-        all_lines = parse_subtitle_file(str(tmp_src))
-        tmp_src.unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sub_file.data['format']}") as tf:
+            tmp_src = Path(tf.name)
+            tf.write(file_data)
+        try:
+            all_lines = parse_subtitle_file(str(tmp_src))
+        finally:
+            tmp_src.unlink(missing_ok=True)
 
         if not all_lines:
             sb.table("translation_jobs").update({"status": "completed", "progress": 100}).eq("id", job_id).execute()
@@ -336,7 +343,8 @@ def _run_translation(
             })
 
         # Write translated SRT file
-        tmp_out = Path(tempfile.mktemp(suffix=".srt"))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+            tmp_out = Path(tf.name)
         write_srt(translated_lines_out, str(tmp_out), use_translated=False)
 
         # Save to local storage
@@ -367,7 +375,7 @@ def _run_translation(
             "translated_lines": total_lines,
             "duration_ms": elapsed_ms,
             "cost_usd": total_cost,
-            "completed_at": "now()",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         # Update project

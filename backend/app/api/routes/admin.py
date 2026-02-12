@@ -62,7 +62,7 @@ def list_users(
     if status:
         query = query.eq("status", status)
     if search:
-        query = query.or_(f"full_name.ilike.%{search}%,id.eq.{search}")
+        query = query.or_(f"full_name.ilike.*{search}*,id.eq.{search}")
 
     result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
 

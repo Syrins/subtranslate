@@ -62,7 +62,7 @@ def run_translation_task(
     try:
         sb.table("translation_jobs").update({
             "status": "processing",
-            "started_at": "now()",
+            "started_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         # Read subtitle file from local storage
@@ -71,10 +71,13 @@ def run_translation_task(
             raise RuntimeError("Subtitle file not found")
 
         file_data = storage.download(sub_file.data["file_url"])
-        tmp_src = Path(tempfile.mktemp(suffix=f".{sub_file.data['format']}"))
-        tmp_src.write_bytes(file_data)
-        all_lines = parse_subtitle_file(str(tmp_src))
-        tmp_src.unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sub_file.data['format']}") as tf:
+            tmp_src = Path(tf.name)
+            tf.write(file_data)
+        try:
+            all_lines = parse_subtitle_file(str(tmp_src))
+        finally:
+            tmp_src.unlink(missing_ok=True)
 
         if not all_lines:
             sb.table("translation_jobs").update({"status": "completed", "progress": 100}).eq("id", job_id).execute()
@@ -125,7 +128,8 @@ def run_translation_task(
             "end_time": l["end_time"], "original_text": translated_map.get(l["line_number"], l["original_text"]),
         } for l in all_lines]
 
-        tmp_out = Path(tempfile.mktemp(suffix=".srt"))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+            tmp_out = Path(tf.name)
         write_srt(translated_lines_out, str(tmp_out), use_translated=False)
         translated_key = storage.get_storage_key(user_id, project_id, "subtitle", f"translated_{subtitle_file_id}.srt")
         with open(tmp_out, "rb") as f:
@@ -143,7 +147,7 @@ def run_translation_task(
 
         sb.table("translation_jobs").update({
             "status": "completed", "progress": 100, "translated_lines": total_lines,
-            "duration_ms": elapsed_ms, "cost_usd": cost_per_line * total_lines, "completed_at": "now()",
+            "duration_ms": elapsed_ms, "cost_usd": cost_per_line * total_lines, "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         sb.table("projects").update({"status": "translated", "translated_lines": total_lines}).eq("id", project_id).execute()
@@ -296,7 +300,7 @@ def run_export_task(
             "output_file_url": storage_key,
             "output_file_size_bytes": output_size,
             "duration_ms": elapsed_ms,
-            "completed_at": "now()",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         sb.table("projects").update({"status": "exported"}).eq("id", project_id).execute()

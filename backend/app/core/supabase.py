@@ -97,19 +97,33 @@ class SupabaseTable:
 
     def limit(self, count: int) -> "SupabaseTable":
         self._headers["Range"] = f"0-{count - 1}"
+        self._headers["Range-Unit"] = "items"
         return self
 
     def range(self, start: int, end: int) -> "SupabaseTable":
         self._headers["Range"] = f"{start}-{end}"
+        self._headers["Range-Unit"] = "items"
         return self
 
     def single(self) -> "SupabaseTable":
         self._headers["Accept"] = "application/vnd.pgrst.object+json"
+        # Allow 0-or-1 row responses without throwing 406 on newer PostgREST
+        prefer = self._headers.get("Prefer")
+        if prefer and "plurality=singular" not in prefer:
+            self._headers["Prefer"] = prefer + ",plurality=singular"
+        elif not prefer:
+            self._headers["Prefer"] = "plurality=singular"
         self._single = True
         return self
 
     def maybeSingle(self) -> "SupabaseTable":
         self._headers["Accept"] = "application/vnd.pgrst.object+json"
+        # Allow 0-or-1 row responses without throwing 406 on newer PostgREST
+        prefer = self._headers.get("Prefer")
+        if prefer and "plurality=singular" not in prefer:
+            self._headers["Prefer"] = prefer + ",plurality=singular"
+        elif not prefer:
+            self._headers["Prefer"] = "plurality=singular"
         self._single = True
         self._maybe_single = True
         return self
@@ -132,8 +146,8 @@ class SupabaseTable:
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        # maybeSingle: return None data instead of raising on 406
-        if getattr(self, "_maybe_single", False) and resp.status_code == 406:
+        # single/maybeSingle: return None data instead of raising on 406
+        if resp.status_code == 406 and (getattr(self, "_maybe_single", False) or getattr(self, "_single", False)):
             return SupabaseResponse(data=None, count=0)
 
         if resp.status_code >= 400:
