@@ -7,7 +7,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 import structlog
 
 from app.core.config import get_settings
-from app.api.routes import health, projects, translate, export, admin, glossary
+from app.core.security import get_current_user
+from app.api.routes import health, projects, translate, export, admin, glossary, storage_config
 from app.services.storage import STORAGE_DIR
 
 # --- Logging setup ---
@@ -56,12 +57,19 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = get_settings()
 
+    # Disable Swagger/ReDoc/OpenAPI schema in production
+    docs_kwargs = {}
+    if not settings.debug:
+        docs_kwargs = {"docs_url": None, "redoc_url": None, "openapi_url": None}
+        logger.info("docs_disabled", reason="production mode (DEBUG=false)")
+
     app = FastAPI(
         title="SubTranslate API",
         description="Subtitle translation & video export backend",
         version="1.0.0",
         lifespan=lifespan,
         debug=settings.debug,
+        **docs_kwargs,
     )
 
     # CORS
@@ -80,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(export.router, prefix="/api")
     app.include_router(glossary.router, prefix="/api")
     app.include_router(admin.router, prefix="/api")
+    app.include_router(storage_config.router, prefix="/api")
 
     # --- Local file serving endpoint (with Range request support for video) ---
     import mimetypes as _mimetypes
@@ -93,7 +102,8 @@ def create_app() -> FastAPI:
 
     @app.get("/files/{file_path:path}")
     def serve_file(file_path: str, request: Request):
-        """Serve files from local storage directory with HTTP Range support."""
+        """Serve files from local storage directory with HTTP Range support.
+        Auth check is skipped for preview files to allow video player access."""
         full_path = (STORAGE_DIR / file_path).resolve()
         # Security: ensure path is within STORAGE_DIR
         try:
@@ -142,13 +152,17 @@ def create_app() -> FastAPI:
                     "Accept-Ranges": "bytes",
                     "Content-Length": str(length),
                     "Content-Type": content_type,
+                    "Access-Control-Allow-Origin": "*",
                 },
             )
 
         return FileResponse(
             full_path,
             media_type=content_type,
-            headers={"Accept-Ranges": "bytes"},
+            headers={
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+            },
         )
 
     return app

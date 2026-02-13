@@ -59,8 +59,9 @@ Kritik env degiskenleri:
 - `GEMINI_API_KEY`
 
 Not:
-- Compose uzerinde `REDIS_URL` servis ici `redis://redis:6379/0` olarak set edilir.
+- Compose uzerinde `REDIS_URL` servis ici `redis://default:{SERVICE_PASSWORD_REDIS}@redis:6379/0` olarak set edilir.
 - `TEMP_DIR` ve `STORAGE_DIR` container path olarak set edilir.
+- `DEBUG=false` oldugunda `/docs`, `/redoc`, `/openapi.json` tamamen kapanir.
 
 ## 5. Auth ve Yetki Modeli
 
@@ -163,8 +164,22 @@ Bu tasarim veri tutarsizliklarini erken yakalamak icin kritiktir.
 FFmpeg kullanim alanlari:
 - Medya metadata probe
 - Embedded subtitle extraction
-- Burn-in export
+- Burn-in export (subtitle styling, force_style destegi)
 - Soft-sub mux
+- Web preview transcoding
+
+Kaynak limitleri:
+- Tum FFmpeg islemleri `-threads 6` ile sinirli (~%25 of 24 core)
+- Celery worker concurrency=2, max-tasks-per-child=50
+
+Upscale destegi:
+- Lanczos algoritma ile 2x'e kadar kaliteli upscale
+- `unsharp` filtre ile kenar netligi arttirilir
+- 2x ustu upscale engellenir (kalite dusuklugu nedeniyle)
+
+Subtitle styling:
+- ASS dosyalarda `subtitle_style` varsa `subtitles=` filtresi kullanilir (`ass=` filtresi `force_style` desteklemez)
+- Altyazi uzantisi translated_file_url'den dinamik belirlenir (.srt, .ass, .ssa, .vtt)
 
 Dosya isleme stratejisi:
 - Buyuk dosyalarda memory yerine file copy tercih edilir.
@@ -173,14 +188,17 @@ Dosya isleme stratejisi:
 ## 11. Operasyon Notlari
 
 Production:
-- `DEBUG=false`
+- `DEBUG=false` (Swagger UI, ReDoc, OpenAPI kapali)
 - Redis ve Celery servisleri zorunlu
 - Health endpoint izlenmeli
 - `backend_storage` volume korunmali
+- Container non-root kullanici ile calisir (appuser:1001)
+- CJK font destegi icin `fonts-noto-cjk` yuklenir
 
 Olcekleme:
-- Backend worker sayisi Dockerfile CMD'den ayarlanir.
-- Celery concurrency compose command ile ayarlanir.
+- Backend: 2 uvicorn worker (Dockerfile CMD)
+- Celery: concurrency=2, max-tasks-per-child=50 (compose command)
+- FFmpeg: -threads 6 (tum islemlerde)
 - En kritik bottleneck: FFmpeg ve translation API throughput.
 
 ## 12. Troubleshooting

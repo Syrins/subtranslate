@@ -68,7 +68,6 @@ export default function UploadPage() {
   const [subtitleTracks, setSubtitleTracks] = useState<TrackInfo[]>([]);
   const [audioTracks, setAudioTracks] = useState<TrackInfo[]>([]);
   const [detectedSourceLang, setDetectedSourceLang] = useState<string | null>(null);
-  const [subtitleTrackCount, setSubtitleTrackCount] = useState(0);
 
   const storageUsed = profile?.storage_used_bytes || 0;
   const storageMax = (plan?.storage_gb || 5) * 1024 * 1024 * 1024;
@@ -197,7 +196,6 @@ export default function UploadPage() {
     setSubtitleTracks([]);
     setAudioTracks([]);
     setDetectedSourceLang(null);
-    setSubtitleTrackCount(0);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 

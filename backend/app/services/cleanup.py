@@ -221,11 +221,16 @@ def ensure_storage_for_upload(user_id: str, needed_bytes: int) -> dict:
     }
 
 
-def _recalculate_storage(sb, user_id: str):
-    """Recalculate total storage used by a user from stored_files."""
+def recalculate_user_storage(sb, user_id: str):
+    """Recalculate total storage used by a user from stored_files.
+    Public helper — used by projects, export, and cleanup modules."""
     result = sb.table("stored_files").select("file_size_bytes").eq("user_id", user_id).eq("uploaded_to_user_storage", False).execute()
     total = sum(f.get("file_size_bytes", 0) for f in (result.data or []))
     sb.table("profiles").update({"storage_used_bytes": total}).eq("id", user_id).execute()
+
+
+# Keep old name as alias for internal callers
+_recalculate_storage = recalculate_user_storage
 
 
 def _format_bytes(b: int) -> str:

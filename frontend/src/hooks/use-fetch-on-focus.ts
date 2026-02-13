@@ -34,39 +34,62 @@ export function useFetchOnFocus<T>(
   const [loading, setLoading] = useState(!skipInitial);
   const [error, setError] = useState<Error | null>(null);
   const lastFetchRef = useRef(0);
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  const hasDataRef = useRef(false);
   const mountedRef = useRef(true);
   const pathname = usePathname();
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+  hasDataRef.current = data !== undefined;
 
-  const doFetch = useCallback(async () => {
+  const doFetch = useCallback(async (force = false) => {
+    if (inFlightRef.current) {
+      // If already in-flight, wait for it instead of silently returning
+      return inFlightRef.current;
+    }
+
     const now = Date.now();
-    if (now - lastFetchRef.current < dedupMs) return;
-    lastFetchRef.current = now;
-
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await fetcherRef.current();
-      if (mountedRef.current) {
-        setData(result);
-      }
-    } catch (err) {
-      if (mountedRef.current) {
-        setError(err instanceof Error ? err : new Error(String(err)));
-      }
-    } finally {
-      if (mountedRef.current) {
+    if (!force && now - lastFetchRef.current < dedupMs) {
+      // Dedup check: if data exists already, just ensure loading is false
+      if (hasDataRef.current) {
         setLoading(false);
       }
+      return;
     }
+    lastFetchRef.current = now;
+
+    const showBlockingLoading = !hasDataRef.current;
+    if (showBlockingLoading) {
+      setLoading(true);
+    }
+    setError(null);
+    const run = (async () => {
+      try {
+        const result = await fetcherRef.current();
+        if (mountedRef.current) {
+          setData(result);
+        }
+      } catch (err) {
+        if (mountedRef.current) {
+          setError(err instanceof Error ? err : new Error(String(err)));
+        }
+      } finally {
+        // Always set loading to false, even if unmounted — prevents stale loading state
+        // on remount since React may reuse state in some scenarios
+        setLoading(false);
+        inFlightRef.current = null;
+      }
+    })();
+
+    inFlightRef.current = run;
+    return run;
   }, [dedupMs]);
 
-  // Initial fetch
+  // Initial fetch on mount
   useEffect(() => {
     mountedRef.current = true;
     if (!skipInitial) {
-      doFetch();
+      doFetch(true); // Force fetch on mount, ignore dedup
     }
     return () => {
       mountedRef.current = false;
@@ -79,7 +102,7 @@ export function useFetchOnFocus<T>(
     doFetch();
   }, [pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Refetch on tab focus
+  // Refetch on tab/browser focus
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {

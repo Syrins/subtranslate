@@ -124,3 +124,30 @@
     @apply bg-background text-foreground;
   }
 }
+
+@layer utilities {
+  .translate-cell-scroll {
+    scrollbar-gutter: stable both-edges;
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--muted-foreground) 45%, transparent) transparent;
+  }
+
+  .translate-cell-scroll::-webkit-scrollbar {
+    height: 6px;
+    width: 6px;
+  }
+
+  .translate-cell-scroll::-webkit-scrollbar-track {
+    border-radius: 999px;
+    background: color-mix(in oklab, var(--muted) 75%, transparent);
+  }
+
+  .translate-cell-scroll::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: color-mix(in oklab, var(--muted-foreground) 45%, transparent);
+  }
+
+  .translate-cell-scroll:hover::-webkit-scrollbar-thumb {
+    background: color-mix(in oklab, var(--primary) 55%, transparent);
+  }
+}

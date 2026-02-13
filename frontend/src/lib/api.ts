@@ -1,12 +1,14 @@
 import { createClient } from "@/lib/supabase/client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_REQUEST_TIMEOUT_MS = 15000;
 
 interface ApiOptions {
   method?: string;
   body?: unknown;
   headers?: Record<string, string>;
   isFormData?: boolean;
+  timeoutMs?: number;
 }
 
 class ApiClient {
@@ -19,7 +21,7 @@ class ApiClient {
   }
 
   async request<T = unknown>(endpoint: string, options: ApiOptions = {}): Promise<T> {
-    const { method = "GET", body, headers = {}, isFormData = false } = options;
+    const { method = "GET", body, headers = {}, isFormData = false, timeoutMs = API_REQUEST_TIMEOUT_MS } = options;
     const authHeaders = await this.getAuthHeaders();
 
     const fetchHeaders: Record<string, string> = {
@@ -31,11 +33,26 @@ class ApiClient {
       fetchHeaders["Content-Type"] = "application/json";
     }
 
-    const res = await fetch(`${API_BASE}${endpoint}`, {
-      method,
-      headers: fetchHeaders,
-      body: isFormData ? (body as FormData) : body ? JSON.stringify(body) : undefined,
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}${endpoint}`, {
+        method,
+        headers: fetchHeaders,
+        body: isFormData ? (body as FormData) : body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+        cache: "no-store",
+      });
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new ApiError(408, "Request timed out. Please try again.");
+      }
+      throw new ApiError(0, err instanceof Error ? err.message : "Network request failed");
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!res.ok) {
       const error = await res.json().catch(() => ({ detail: res.statusText }));
@@ -60,6 +77,7 @@ class ApiClient {
       method: "POST",
       body: formData,
       isFormData: true,
+      timeoutMs: 5 * 60 * 1000,
     });
   }
 
@@ -68,6 +86,7 @@ class ApiClient {
       method: "POST",
       body: formData,
       isFormData: true,
+      timeoutMs: 5 * 60 * 1000,
     });
   }
 
@@ -79,6 +98,13 @@ class ApiClient {
     return this.request<StorageInfo>("/api/projects/storage/info");
   }
 
+  createWebPreview(projectId: string) {
+    return this.request<{ video_url: string; cached: boolean; error?: string }>(`/api/projects/${projectId}/web-preview`, {
+      method: "POST",
+      timeoutMs: 5 * 60 * 1000,
+    });
+  }
+
   getSubtitleTracks(projectId: string) {
     return this.request<SubtitleTrack[]>(`/api/projects/${projectId}/tracks`);
   }
@@ -88,16 +114,17 @@ class ApiClient {
     return this.request<SubtitleLine[]>(`/api/projects/${projectId}/subtitles${params}`);
   }
 
-  batchUpdateSubtitles(projectId: string, edits: Record<string, string>) {
+  batchUpdateSubtitles(projectId: string, edits: Record<string, string | { translated_text?: string; start_time?: string; end_time?: string }>) {
     return this.request<{ updated: number }>(`/api/projects/${projectId}/subtitles/batch`, {
       method: "PATCH",
       body: { edits },
     });
   }
 
-  exportSrt(projectId: string, translated = true) {
+  exportSrt(projectId: string, translated = true, subtitleFileId?: string) {
+    const trackParam = subtitleFileId ? `&subtitle_file_id=${encodeURIComponent(subtitleFileId)}` : "";
     return this.request<{ filename: string; content: string }>(
-      `/api/projects/${projectId}/export-srt?translated=${translated}`
+      `/api/projects/${projectId}/export-srt?translated=${translated}${trackParam}`
     );
   }
 
@@ -137,12 +164,33 @@ class ApiClient {
     return this.request(`/api/export/${jobId}/cancel`, { method: "POST" });
   }
 
+  getActiveExportJob(projectId: string) {
+    return this.request<ExportJob | null>(`/api/export/active/${projectId}`);
+  }
+
+  deletePreviousExport(projectId: string) {
+    return this.request<{ deleted_files: number; message: string }>(`/api/export/previous/${projectId}`, { method: "DELETE" });
+  }
+
   getExportDownload(jobId: string) {
     return this.request<{ url: string; expires_in: number }>(`/api/export/${jobId}/download`);
   }
 
   markUploadedToOwnStorage(projectId: string) {
     return this.request(`/api/export/${projectId}/uploaded-to-own-storage`, { method: "POST" });
+  }
+
+  // Storage file management
+  listStoredFiles(location: "system" | "external" | "all" = "all") {
+    return this.request<StoredFile[]>(`/api/projects/storage/files?location=${location}`);
+  }
+
+  deleteStoredFile(fileId: string) {
+    return this.request<{ ok: boolean }>(`/api/projects/storage/files/${fileId}`, { method: "DELETE" });
+  }
+
+  getStoredFileUrl(fileId: string) {
+    return this.request<{ url: string; storage_path: string }>(`/api/projects/storage/files/${fileId}/url`);
   }
 
   // Glossary
@@ -156,6 +204,49 @@ class ApiClient {
 
   deleteGlossaryTerm(id: string) {
     return this.request(`/api/glossary/${id}`, { method: "DELETE" });
+  }
+
+  // External Storage Config
+  testStorageConnection() {
+    return this.request<ExternalStorageTestResult>("/api/storage-config/test", { method: "POST" });
+  }
+
+  testCustomStorageConnection(body: Record<string, string>) {
+    return this.request<ExternalStorageTestResult>("/api/storage-config/test-custom", {
+      method: "POST",
+      body,
+    });
+  }
+
+  listExternalFiles(prefix = "", maxKeys = 200) {
+    const params = new URLSearchParams();
+    if (prefix) params.set("prefix", prefix);
+    params.set("max_keys", String(maxKeys));
+    return this.request<ExternalFileListResult>(`/api/storage-config/files?${params.toString()}`);
+  }
+
+  getExternalFileInfo(key: string) {
+    return this.request<ExternalFileInfo>(`/api/storage-config/files/info?key=${encodeURIComponent(key)}`);
+  }
+
+  getExternalFileUrl(key: string, expiresIn = 3600) {
+    return this.request<{ ok: boolean; url: string; expires_in: number }>(
+      `/api/storage-config/files/url?key=${encodeURIComponent(key)}&expires_in=${expiresIn}`
+    );
+  }
+
+  deleteExternalFile(key: string) {
+    return this.request<{ ok: boolean; message: string }>(
+      `/api/storage-config/files?key=${encodeURIComponent(key)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  renameExternalFile(oldKey: string, newKey: string) {
+    return this.request<{ ok: boolean; message: string }>("/api/storage-config/files/rename", {
+      method: "POST",
+      body: { old_key: oldKey, new_key: newKey },
+    });
   }
 
   // Health
@@ -190,6 +281,7 @@ export interface Project {
   total_lines: number;
   translated_lines: number;
   video_url: string | null;
+  needs_transcode?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -218,7 +310,8 @@ export interface SubtitleLine {
 export interface TranslationJobCreate {
   project_id: string;
   subtitle_file_id?: string;
-  engine: "openai" | "deepl" | "gemini";
+  engine: "openai" | "deepl" | "gemini" | "openrouter";
+  model_id?: string;
   source_lang: string;
   target_lang: string;
   context_enabled?: boolean;
@@ -246,6 +339,7 @@ export interface ExportJobCreate {
   audio_codec?: string;
   include_watermark?: boolean;
   watermark_text?: string;
+  watermark_position?: string;
   keep_audio_tracks?: boolean;
   upload_to_storage?: boolean;
   subtitle_style?: Record<string, unknown>;
@@ -275,6 +369,20 @@ export interface StorageInfo {
   warning: string | null;
 }
 
+export interface StoredFile {
+  id: string;
+  user_id: string;
+  project_id: string;
+  file_type: string;
+  storage_path: string;
+  file_size_bytes: number;
+  cdn_url: string;
+  uploaded_to_user_storage: boolean;
+  expires_at: string | null;
+  created_at: string;
+  project_name: string;
+}
+
 export interface GlossaryTerm {
   id: string;
   user_id: string;
@@ -282,6 +390,35 @@ export interface GlossaryTerm {
   target_term: string;
   source_lang: string;
   target_lang: string;
+}
+
+export interface ExternalStorageTestResult {
+  ok: boolean;
+  message: string;
+}
+
+export interface ExternalBucketFile {
+  key: string;
+  size: number;
+  last_modified: string;
+  etag: string;
+}
+
+export interface ExternalFileListResult {
+  ok: boolean;
+  files: ExternalBucketFile[];
+  truncated: boolean;
+  count: number;
+  message?: string;
+}
+
+export interface ExternalFileInfo {
+  ok: boolean;
+  key: string;
+  size: number;
+  content_type: string;
+  last_modified: string;
+  etag: string;
 }
 
 export interface HealthCheck {

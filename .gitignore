@@ -41,3 +41,7 @@ backend/test.py
 celerybeat-schedule*
 *.log
 .pids/
+
+#Windwos Start
+start.ps1
+stop.ps1

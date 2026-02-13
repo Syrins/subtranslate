@@ -13,6 +13,7 @@ import {
   Sparkles,
   LogOut,
   Shield,
+  HardDrive,
 } from "lucide-react";
 import {
   Sidebar,
@@ -158,6 +159,18 @@ export function AppSidebar() {
                   <Link href="/settings">
                     <Settings className="h-4 w-4 shrink-0" />
                     <span className="truncate">Ayarlar</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  asChild
+                  isActive={pathname === "/storage"}
+                  tooltip="Dosya Yöneticisi"
+                >
+                  <Link href="/storage">
+                    <HardDrive className="h-4 w-4 shrink-0" />
+                    <span className="truncate">Dosya Yöneticisi</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

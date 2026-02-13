@@ -21,6 +21,7 @@ import {
   ArrowLeft,
   Clock,
   FileText,
+  AlertTriangle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -47,6 +48,16 @@ import { api, type Project } from "@/lib/api";
 import { useAuthContext } from "@/components/auth-provider";
 import { createClient } from "@/lib/supabase/client";
 import { toast } from "sonner";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -62,19 +73,19 @@ function ExportPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const projectId = searchParams.get("project");
-  const { user, plan } = useAuthContext();
+  const { user, plan, loading: authLoading } = useAuthContext();
 
-  const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState(projectId || "");
   const [project, setProject] = useState<Project | null>(null);
 
   // Export settings
   const [subtitleMode, setSubtitleMode] = useState("burn_in");
   const [resolution, setResolution] = useState("original");
-  const [videoCodec, setVideoCodec] = useState("h264");
-  const [audioCodec, setAudioCodec] = useState("aac");
+  const [videoCodec, setVideoCodec] = useState("copy");
+  const [audioCodec, setAudioCodec] = useState("copy");
   const [includeWatermark, setIncludeWatermark] = useState(false);
   const [watermarkText, setWatermarkText] = useState("SubTranslate");
+  const [watermarkPosition, setWatermarkPosition] = useState("bottom-right");
   const [keepAudioTracks, setKeepAudioTracks] = useState(true);
 
   // Subtitle style from editor (stored in localStorage)
@@ -94,28 +105,118 @@ function ExportPageInner() {
   const [elapsedTime, setElapsedTime] = useState(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollErrorCountRef = useRef(0);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const realtimeChannelRef = useRef<any>(null);
+
+  // Re-export warning
+  const [showReExportDialog, setShowReExportDialog] = useState(false);
+  const [deletingPrevious, setDeletingPrevious] = useState(false);
 
   // Load projects list (refreshes on navigation back)
-  const { data: fetchedProjects } = useFetchOnFocus(
+  const {
+    data: fetchedProjects,
+    loading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useFetchOnFocus(
     () => api.listProjects(),
-    { pathPrefix: "/export" }
+    { pathPrefix: "/export", dedupMs: 0 }
   );
+  const projects = fetchedProjects ?? [];
+
   useEffect(() => {
-    if (fetchedProjects) setProjects(fetchedProjects);
-  }, [fetchedProjects]);
+    if (!authLoading) {
+      refetchProjects();
+    }
+  }, [authLoading, refetchProjects]);
 
   // Load subtitle style from localStorage (set by editor page)
+  // Try project-specific key first, then fall back to global key
   useEffect(() => {
+    if (!selectedProjectId) return;
+    try {
+      const projectRaw = localStorage.getItem(`subtitle_style_${selectedProjectId}`);
+      if (projectRaw) {
+        setSubtitleStyle(JSON.parse(projectRaw));
+        return;
+      }
+    } catch { /* ignore */ }
     try {
       const raw = localStorage.getItem("export_subtitle_style");
       if (raw) setSubtitleStyle(JSON.parse(raw));
     } catch { /* ignore */ }
-  }, []);
+  }, [selectedProjectId]);
+
+  // Check for unsaved editor edits in localStorage and auto-save them before export
+  const [pendingEditsApplied, setPendingEditsApplied] = useState(false);
+  useEffect(() => {
+    if (!selectedProjectId || pendingEditsApplied) return;
+    // Look for any editor_edits_ keys matching this project
+    const prefix = `editor_edits_${selectedProjectId}_`;
+    const allEdits: Record<string, Record<string, unknown>> = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(prefix)) {
+          const raw = localStorage.getItem(key);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.edits && Object.keys(parsed.edits).length > 0) {
+              Object.assign(allEdits, parsed.edits);
+            }
+          }
+        }
+      }
+    } catch { /* ignore */ }
+    if (Object.keys(allEdits).length > 0) {
+      // Auto-save unsaved edits to backend
+      api.batchUpdateSubtitles(selectedProjectId, allEdits as Record<string, string | { translated_text?: string; start_time?: string; end_time?: string }>)
+        .then(() => {
+          // Clear the localStorage entries after successful save
+          for (let i = localStorage.length - 1; i >= 0; i--) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith(prefix)) {
+              localStorage.removeItem(key);
+            }
+          }
+          toast.success(`${Object.keys(allEdits).length} kaydedilmemiş düzenleme otomatik kaydedildi.`);
+        })
+        .catch(() => { /* ignore — edits will still be in localStorage */ })
+        .finally(() => setPendingEditsApplied(true));
+    } else {
+      setPendingEditsApplied(true);
+    }
+  }, [selectedProjectId, pendingEditsApplied]);
 
   useEffect(() => {
     if (!selectedProjectId) return;
-    api.getProject(selectedProjectId).then(setProject).catch(() => {});
+    api.getProject(selectedProjectId).then(setProject).catch(() => { });
   }, [selectedProjectId]);
+
+  // Auto-resume: check for active export jobs on page load
+  const resumeCheckedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selectedProjectId || !user) return;
+    // Only check once per project
+    if (resumeCheckedRef.current === selectedProjectId) return;
+    resumeCheckedRef.current = selectedProjectId;
+
+    api.getActiveExportJob(selectedProjectId).then((activeJob) => {
+      if (activeJob && (activeJob.status === "queued" || activeJob.status === "processing")) {
+        // Resume the active job
+        setJobId(activeJob.id);
+        setJobStatus(activeJob.status);
+        setJobProgress(activeJob.progress ?? 0);
+        setErrorMsg(null);
+        setDownloadUrl(null);
+        // Start polling and timer
+        startPolling(activeJob.id);
+        timerRef.current = setInterval(() => setElapsedTime((p) => p + 1), 1000);
+      }
+    }).catch(() => { /* ignore — maybe user not logged in yet */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, user]);
 
   // Check if user has storage config
   useEffect(() => {
@@ -140,43 +241,111 @@ function ExportPageInner() {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
+      if (realtimeChannelRef.current) {
+        const supabase = createClient();
+        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeChannelRef.current = null;
+      }
     };
   }, []);
 
+  const handleJobUpdate = useCallback(async (jid: string, job: { status: string; progress: number; error_message?: string | null }) => {
+    setJobStatus(job.status);
+    setJobProgress(job.progress ?? 0);
+    if (job.status === "completed") {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      if (realtimeChannelRef.current) {
+        const supabase = createClient();
+        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeChannelRef.current = null;
+      }
+      toast.success("Dışa aktarma tamamlandı!");
+      try {
+        const dl = await api.getExportDownload(jid);
+        const fullUrl = dl.url.startsWith("http") ? dl.url : `${API_BASE}${dl.url}`;
+        setDownloadUrl(fullUrl);
+      } catch { /* ignore */ }
+      if (selectedProjectId) {
+        api.getProject(selectedProjectId).then(setProject).catch(() => { });
+      }
+    } else if (job.status === "failed") {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      if (realtimeChannelRef.current) {
+        const supabase = createClient();
+        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeChannelRef.current = null;
+      }
+      setErrorMsg(job.error_message || "Dışa aktarma başarısız.");
+      toast.error(job.error_message || "Dışa aktarma başarısız.");
+    }
+  }, [selectedProjectId]);
+
   const startPolling = useCallback((jid: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    pollErrorCountRef.current = 0;
+
+    // Subscribe to Supabase Realtime as backup channel
+    try {
+      const supabase = createClient();
+      if (realtimeChannelRef.current) {
+        supabase.removeChannel(realtimeChannelRef.current);
+      }
+      const channel = supabase
+        .channel(`export-job-${jid}`)
+        .on(
+          "postgres_changes" as never,
+          { event: "UPDATE", schema: "public", table: "export_jobs", filter: `id=eq.${jid}` },
+          (payload: { new: { status: string; progress: number; error_message?: string } }) => {
+            if (payload.new) {
+              handleJobUpdate(jid, payload.new);
+            }
+          }
+        )
+        .subscribe();
+      realtimeChannelRef.current = channel;
+    } catch { /* realtime is optional backup */ }
+
+    // Primary polling mechanism
     pollRef.current = setInterval(async () => {
       try {
         const job = await api.getExportJob(jid);
-        setJobStatus(job.status);
-        setJobProgress(job.progress);
-        if (job.status === "completed") {
-          clearInterval(pollRef.current!);
-          pollRef.current = null;
-          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-          toast.success("Dışa aktarma tamamlandı!");
-          try {
-            const dl = await api.getExportDownload(jid);
-            // Prepend API_BASE to relative URL from backend
-            const fullUrl = dl.url.startsWith("http") ? dl.url : `${API_BASE}${dl.url}`;
-            setDownloadUrl(fullUrl);
-          } catch { /* ignore */ }
-          // Refresh project data
-          if (selectedProjectId) {
-            api.getProject(selectedProjectId).then(setProject).catch(() => {});
-          }
-        } else if (job.status === "failed") {
-          clearInterval(pollRef.current!);
-          pollRef.current = null;
-          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-          setErrorMsg(job.error_message || "Dışa aktarma başarısız.");
-          toast.error(job.error_message || "Dışa aktarma başarısız.");
-        }
-      } catch { /* ignore */ }
-    }, 3000);
-  }, []);
+        pollErrorCountRef.current = 0; // Reset on success
+        handleJobUpdate(jid, job);
+      } catch (err) {
+        pollErrorCountRef.current += 1;
+        console.warn(`Export poll error (${pollErrorCountRef.current}):`, err);
 
-  const startExport = async () => {
+        // After 3 consecutive failures, try refreshing the auth session
+        if (pollErrorCountRef.current === 3) {
+          try {
+            const supabase = createClient();
+            await supabase.auth.refreshSession();
+            console.info("Auth session refreshed after poll errors");
+          } catch { /* ignore refresh error */ }
+        }
+
+        // After 10 consecutive failures, try a direct Supabase query as fallback
+        if (pollErrorCountRef.current >= 10 && pollErrorCountRef.current % 5 === 0) {
+          try {
+            const supabase = createClient();
+            const { data } = await supabase
+              .from("export_jobs")
+              .select("status, progress, error_message")
+              .eq("id", jid)
+              .single();
+            if (data) {
+              pollErrorCountRef.current = 0;
+              handleJobUpdate(jid, data);
+            }
+          } catch { /* ignore fallback error */ }
+        }
+      }
+    }, 3000);
+  }, [handleJobUpdate]);
+
+  const doStartExport = async () => {
     if (!selectedProjectId) return;
     setErrorMsg(null);
     setDownloadUrl(null);
@@ -190,6 +359,7 @@ function ExportPageInner() {
         audio_codec: audioCodec,
         include_watermark: includeWatermark,
         watermark_text: includeWatermark ? watermarkText : undefined,
+        watermark_position: includeWatermark ? watermarkPosition : undefined,
         keep_audio_tracks: keepAudioTracks,
         upload_to_storage: deliveryMethod === "storage",
         subtitle_style: subtitleMode === "burn_in" ? subtitleStyle ?? undefined : undefined,
@@ -199,10 +369,37 @@ function ExportPageInner() {
       setJobProgress(0);
       toast.info("Dışa aktarma başlatıldı...");
       startPolling(result.id);
-      // Start elapsed timer
       timerRef.current = setInterval(() => setElapsedTime((p) => p + 1), 1000);
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : "Dışa aktarma başlatılamadı.");
+    }
+  };
+
+  const handleStartExport = () => {
+    if (project?.status === "exported") {
+      setShowReExportDialog(true);
+    } else {
+      doStartExport();
+    }
+  };
+
+  const confirmReExport = async () => {
+    if (!selectedProjectId) return;
+    setDeletingPrevious(true);
+    try {
+      await api.deletePreviousExport(selectedProjectId);
+      toast.success("Önceki dışa aktarma silindi.");
+      // Refresh project data
+      const updatedProject = await api.getProject(selectedProjectId);
+      setProject(updatedProject);
+      setShowReExportDialog(false);
+      setDeletingPrevious(false);
+      // Start the new export
+      await doStartExport();
+    } catch (err: unknown) {
+      setDeletingPrevious(false);
+      setShowReExportDialog(false);
+      toast.error(err instanceof Error ? err.message : "Önceki dışa aktarma silinemedi.");
     }
   };
 
@@ -242,6 +439,40 @@ function ExportPageInner() {
   const watermarkRequired = plan?.watermark_required ?? true;
 
   if (!selectedProjectId) {
+    if (authLoading || (projectsLoading && fetchedProjects === undefined)) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        </div>
+      );
+    }
+
+    if (projectsError) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6 text-center">
+          <FolderOpen className="h-12 w-12 text-muted-foreground" />
+          <h2 className="text-xl font-bold">Projeler yuklenemedi</h2>
+          <p className="text-muted-foreground">Lutfen tekrar deneyin.</p>
+          <Button onClick={() => refetchProjects()}>
+            Tekrar Dene
+          </Button>
+        </div>
+      );
+    }
+
+    if (projects.length === 0) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6 text-center">
+          <FolderOpen className="h-12 w-12 text-muted-foreground" />
+          <h2 className="text-xl font-bold">Henuz proje yok</h2>
+          <p className="text-muted-foreground">Disa aktarma icin once bir proje olusturun.</p>
+          <Button onClick={() => router.push("/upload")}>
+            Proje Olustur
+          </Button>
+        </div>
+      );
+    }
+
     return (
       <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6">
         <FolderOpen className="h-12 w-12 text-muted-foreground" />
@@ -413,9 +644,35 @@ function ExportPageInner() {
                 <Switch checked={includeWatermark || watermarkRequired} onCheckedChange={setIncludeWatermark} disabled={watermarkRequired || isExporting} />
               </div>
               {(includeWatermark || watermarkRequired) && (
-                <div className="space-y-2">
-                  <Label>Filigran Metni</Label>
-                  <Input value={watermarkText} onChange={(e) => setWatermarkText(e.target.value)} placeholder="Filigran metni..." disabled={isExporting} />
+                <div className="space-y-3">
+                  <div className="space-y-2">
+                    <Label>Filigran Metni</Label>
+                    <Input value={watermarkText} onChange={(e) => setWatermarkText(e.target.value)} placeholder="Filigran metni..." disabled={isExporting} />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Filigran Pozisyonu</Label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { value: "top-left", label: "Sol Ust" },
+                        { value: "top-right", label: "Sag Ust" },
+                        { value: "bottom-left", label: "Sol Alt" },
+                        { value: "bottom-right", label: "Sag Alt" },
+                      ].map((pos) => (
+                        <button
+                          key={pos.value}
+                          className={`rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                            watermarkPosition === pos.value
+                              ? "border-primary bg-primary/10 text-primary"
+                              : "hover:bg-accent"
+                          }`}
+                          onClick={() => setWatermarkPosition(pos.value)}
+                          disabled={isExporting}
+                        >
+                          {pos.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               )}
             </CardContent>
@@ -432,11 +689,10 @@ function ExportPageInner() {
             <CardContent>
               <div className="grid gap-3 sm:grid-cols-2">
                 <button
-                  className={`flex items-start gap-3 rounded-lg border p-4 text-left transition-colors ${
-                    deliveryMethod === "download"
-                      ? "border-primary bg-primary/5 ring-1 ring-primary"
-                      : "hover:bg-accent"
-                  }`}
+                  className={`flex items-start gap-3 rounded-lg border p-4 text-left transition-colors ${deliveryMethod === "download"
+                    ? "border-primary bg-primary/5 ring-1 ring-primary"
+                    : "hover:bg-accent"
+                    }`}
                   onClick={() => setDeliveryMethod("download")}
                   disabled={isExporting}
                 >
@@ -447,11 +703,10 @@ function ExportPageInner() {
                   </div>
                 </button>
                 <button
-                  className={`flex items-start gap-3 rounded-lg border p-4 text-left transition-colors ${
-                    deliveryMethod === "storage"
-                      ? "border-primary bg-primary/5 ring-1 ring-primary"
-                      : hasUserStorage ? "hover:bg-accent" : "opacity-50 cursor-not-allowed"
-                  }`}
+                  className={`flex items-start gap-3 rounded-lg border p-4 text-left transition-colors ${deliveryMethod === "storage"
+                    ? "border-primary bg-primary/5 ring-1 ring-primary"
+                    : hasUserStorage ? "hover:bg-accent" : "opacity-50 cursor-not-allowed"
+                    }`}
                   onClick={() => hasUserStorage && setDeliveryMethod("storage")}
                   disabled={isExporting || !hasUserStorage}
                 >
@@ -523,6 +778,80 @@ function ExportPageInner() {
             </Card>
           )}
 
+          {/* Subtitle style preview */}
+          {subtitleStyle && subtitleMode === "burn_in" && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Palette className="h-4 w-4 text-primary" />
+                  Altyazi Stili
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {/* Live preview */}
+                <div className="relative rounded-lg bg-black/90 p-4 overflow-hidden" style={{ minHeight: 60 }}>
+                  <p
+                    className="text-center leading-snug"
+                    style={{
+                      fontFamily: (subtitleStyle.font_family as string) || "Arial",
+                      fontSize: Math.min(Number(subtitleStyle.font_size) || 24, 28),
+                      color: (subtitleStyle.font_color as string) || "#FFFFFF",
+                      fontWeight: subtitleStyle.bold ? "bold" : "normal",
+                      fontStyle: subtitleStyle.italic ? "italic" : "normal",
+                      textShadow: `1px 1px ${Number(subtitleStyle.outline_width) || 2}px ${(subtitleStyle.outline_color as string) || "#000"}`,
+                      letterSpacing: Number(subtitleStyle.letter_spacing) || 0,
+                    }}
+                  >
+                    Ornek altyazi metni
+                  </p>
+                </div>
+                {/* Style details */}
+                <div className="space-y-1.5 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Font</span>
+                    <span className="font-medium truncate ml-2 max-w-[120px]">{(subtitleStyle.font_family as string) || "Arial"}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Boyut</span>
+                    <span>{Number(subtitleStyle.font_size) || 24}px</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-muted-foreground">Renk</span>
+                    <div className="flex items-center gap-1.5">
+                      <div className="h-3.5 w-3.5 rounded-full border" style={{ backgroundColor: (subtitleStyle.font_color as string) || "#FFF" }} />
+                      <span className="text-xs font-mono">{(subtitleStyle.font_color as string) || "#FFFFFF"}</span>
+                    </div>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-muted-foreground">Kenar</span>
+                    <div className="flex items-center gap-1.5">
+                      <div className="h-3.5 w-3.5 rounded-full border" style={{ backgroundColor: (subtitleStyle.outline_color as string) || "#000" }} />
+                      <span className="text-xs">{Number(subtitleStyle.outline_width) || 2}px</span>
+                    </div>
+                  </div>
+                  {(Boolean(subtitleStyle.bold) || Boolean(subtitleStyle.italic)) && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Stil</span>
+                      <span>
+                        {Boolean(subtitleStyle.bold) ? "Kalin" : ""}
+                        {Boolean(subtitleStyle.bold) && Boolean(subtitleStyle.italic) ? " + " : ""}
+                        {Boolean(subtitleStyle.italic) ? "Italik" : ""}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full text-xs"
+                  onClick={() => router.push(`/editor?project=${selectedProjectId}`)}
+                >
+                  Editorde Duzenle
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Export summary */}
           <Card>
             <CardHeader>
@@ -553,6 +882,14 @@ function ExportPageInner() {
                   <span className="text-muted-foreground">Filigran</span>
                   <span>{includeWatermark || watermarkRequired ? watermarkText : "Yok"}</span>
                 </div>
+                {(includeWatermark || watermarkRequired) && (
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Filigran Pozisyonu</span>
+                    <span className="text-xs">
+                      {watermarkPosition === "top-left" ? "Sol Ust" : watermarkPosition === "top-right" ? "Sag Ust" : watermarkPosition === "bottom-left" ? "Sol Alt" : "Sag Alt"}
+                    </span>
+                  </div>
+                )}
                 <Separator />
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Teslim</span>
@@ -568,10 +905,21 @@ function ExportPageInner() {
           <Card>
             <CardContent className="pt-6">
               {!isExporting && !exportDone && !errorMsg && jobStatus !== "cancelled" ? (
-                <Button className="w-full" size="lg" onClick={startExport} disabled={!project}>
-                  <Download className="mr-2 h-5 w-5" />
-                  Dışa Aktarmayı Başlat
-                </Button>
+                <div className="space-y-3">
+                  {project?.status === "exported" && (
+                    <div className="flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+                      <div>
+                        <p className="text-sm font-medium text-amber-600 dark:text-amber-400">Bu video zaten dışa aktarıldı</p>
+                        <p className="text-xs text-amber-600/80 dark:text-amber-400/70 mt-0.5">Tekrar dışa aktarırsanız önceki video silinecektir.</p>
+                      </div>
+                    </div>
+                  )}
+                  <Button className="w-full" size="lg" onClick={handleStartExport} disabled={!project}>
+                    <Download className="mr-2 h-5 w-5" />
+                    {project?.status === "exported" ? "Tekrar Dışa Aktar" : "Dışa Aktarmayı Başlat"}
+                  </Button>
+                </div>
               ) : isExporting ? (
                 <div className="space-y-4">
                   <div className="flex items-center gap-3">
@@ -678,6 +1026,32 @@ function ExportPageInner() {
           </Card>
         </div>
       </div>
+
+      {/* Re-export confirmation dialog */}
+      <AlertDialog open={showReExportDialog} onOpenChange={setShowReExportDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Tekrar Dışa Aktar</AlertDialogTitle>
+            <AlertDialogDescription>
+              Bu proje zaten dışa aktarılmış. Tekrar dışa aktarırsanız önceki dışa aktarılan video <strong>kalıcı olarak silinecektir</strong>. Bu işlem geri alınamaz.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingPrevious}>İptal</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmReExport}
+              disabled={deletingPrevious}
+              className="bg-destructive text-white hover:bg-destructive/90"
+            >
+              {deletingPrevious ? (
+                <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Siliniyor...</>
+              ) : (
+                "Öncekini Sil ve Başlat"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

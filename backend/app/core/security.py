@@ -1,7 +1,5 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt
-from app.core.config import get_settings
 from app.core.supabase import get_supabase_admin
 
 security = HTTPBearer()

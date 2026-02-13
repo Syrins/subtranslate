@@ -59,8 +59,9 @@ Critical env vars:
 - `GEMINI_API_KEY`
 
 Notes:
-- In Compose, `REDIS_URL` is injected as `redis://redis:6379/0`.
+- In Compose, `REDIS_URL` is injected as `redis://default:{SERVICE_PASSWORD_REDIS}@redis:6379/0`.
 - `TEMP_DIR` and `STORAGE_DIR` are container paths.
+- When `DEBUG=false`, `/docs`, `/redoc`, and `/openapi.json` are fully disabled.
 
 ## 5. Auth and Authorization Model
 
@@ -162,8 +163,22 @@ This is intentional to catch data consistency issues early.
 Used for:
 - media probing
 - subtitle extraction
-- burn-in rendering
+- burn-in rendering (subtitle styling, force_style support)
 - soft-sub muxing
+- web preview transcoding
+
+Resource limits:
+- All FFmpeg operations use `-threads 6` (~25% of 24 cores)
+- Celery worker concurrency=2, max-tasks-per-child=50
+
+Upscale support:
+- Lanczos algorithm for quality upscale up to 2x
+- `unsharp` filter for edge clarity enhancement
+- Beyond 2x upscale is blocked (poor quality)
+
+Subtitle styling:
+- When `subtitle_style` is provided, `subtitles=` filter is always used (`ass=` filter ignores `force_style`)
+- Subtitle extension is dynamically detected from translated_file_url (.srt, .ass, .ssa, .vtt)
 
 Strategy:
 - large file operations prefer copy-on-disk over in-memory load
@@ -172,14 +187,17 @@ Strategy:
 ## 11. Operations
 
 Production baseline:
-- set `DEBUG=false`
+- `DEBUG=false` (Swagger UI, ReDoc, OpenAPI disabled)
 - keep Redis and Celery always running
 - monitor `/health`
 - preserve `backend_storage` volume
+- container runs as non-root user (appuser:1001)
+- CJK font support via `fonts-noto-cjk` package
 
 Scaling levers:
-- backend worker count in `backend/Dockerfile` CMD
-- celery concurrency in `docker-compose.yml`
+- Backend: 2 uvicorn workers (Dockerfile CMD)
+- Celery: concurrency=2, max-tasks-per-child=50 (compose command)
+- FFmpeg: -threads 6 (all operations)
 - primary bottlenecks are FFmpeg and external translation APIs
 
 ## 12. Troubleshooting

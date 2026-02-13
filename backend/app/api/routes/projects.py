@@ -3,6 +3,7 @@ from typing import Optional
 import shutil
 import uuid
 import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import structlog
@@ -11,10 +12,10 @@ from app.core.security import get_current_user
 from app.core.supabase import get_supabase_admin
 from app.core.config import get_settings
 from app.models.schemas import ProjectCreate, ProjectResponse, UrlDownloadRequest
-from app.utils.ffmpeg import get_media_info, extract_all_subtitles
+from app.utils.ffmpeg import get_media_info, extract_all_subtitles, create_web_preview, needs_web_transcode
 from app.services.subtitle_parser import parse_subtitle_file, write_srt
 from app.services.storage import get_r2_storage
-from app.services.cleanup import ensure_storage_for_upload, check_storage_limit
+from app.services.cleanup import ensure_storage_for_upload, check_storage_limit, recalculate_user_storage
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/projects", tags=["Projects"])
@@ -59,18 +60,247 @@ def get_storage_info(user: dict = Depends(get_current_user)):
     return check_storage_limit(user["id"])
 
 
+@router.get("/storage/files")
+def list_stored_files(
+    location: str = "all",
+    user: dict = Depends(get_current_user),
+):
+    """List stored files for the current user with project names.
+
+    Query params:
+      location: 'system' (on server), 'external' (uploaded to user storage), 'all' (default)
+    """
+    sb = get_supabase_admin()
+    query = (
+        sb.table("stored_files")
+        .select("*, projects(name)")
+        .eq("user_id", user["id"])
+    )
+    if location == "system":
+        query = query.eq("uploaded_to_user_storage", False)
+    elif location == "external":
+        query = query.eq("uploaded_to_user_storage", True)
+    # 'all' → no filter
+
+    result = query.order("created_at", desc=True).execute()
+
+    files = []
+    for f in (result.data or []):
+        project_info = f.pop("projects", None)
+        f["project_name"] = project_info.get("name", "—") if project_info else "—"
+        files.append(f)
+    return files
+
+
+@router.patch("/storage/files/{file_id}/rename")
+def rename_stored_file(file_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """Rename a stored file's display name."""
+    sb = get_supabase_admin()
+    new_name = body.get("display_name", "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="display_name is required")
+
+    file_record = sb.table("stored_files").select("id").eq("id", file_id).eq("user_id", user["id"]).single().execute()
+    if not file_record.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    sb.table("stored_files").update({"display_name": new_name}).eq("id", file_id).execute()
+    return {"ok": True}
+
+
+@router.delete("/storage/files/{file_id}")
+def delete_stored_file(file_id: str, user: dict = Depends(get_current_user)):
+    """Delete a stored file from storage and database."""
+    sb = get_supabase_admin()
+    r2 = get_r2_storage()
+
+    file_record = sb.table("stored_files").select("*").eq("id", file_id).eq("user_id", user["id"]).single().execute()
+    if not file_record.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Delete from storage
+    try:
+        r2.delete(file_record.data["storage_path"])
+    except Exception as e:
+        logger.warning("storage_file_delete_failed", key=file_record.data["storage_path"], error=str(e))
+
+    # Delete DB record
+    sb.table("stored_files").delete().eq("id", file_id).execute()
+
+    # Recalculate storage
+    _recalculate_user_storage(sb, user["id"])
+    return {"ok": True}
+
+
+@router.get("/storage/files/{file_id}/url")
+def get_stored_file_url(file_id: str, user: dict = Depends(get_current_user)):
+    """Get CDN/download URL for a stored file."""
+    sb = get_supabase_admin()
+
+    file_record = sb.table("stored_files").select("storage_path, cdn_url").eq("id", file_id).eq("user_id", user["id"]).single().execute()
+    if not file_record.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return {"url": file_record.data.get("cdn_url", ""), "storage_path": file_record.data["storage_path"]}
+
+
 @router.get("/{project_id}")
 def get_project(project_id: str, user: dict = Depends(get_current_user)):
     """Get a single project with details."""
     sb = get_supabase_admin()
+    r2 = get_r2_storage()
     result = sb.table("projects").select("*").eq("id", project_id).eq("user_id", user["id"]).single().execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Project not found")
     data = result.data
     # Add video_url for frontend playback
+    data["needs_transcode"] = False
     if data.get("file_url"):
-        data["video_url"] = f"/files/{data['file_url']}"
+        file_url = data["file_url"]
+        has_preview = False
+        # 1) Check stored_files DB for existing web preview
+        try:
+            preview = sb.table("stored_files").select("storage_path").eq(
+                "project_id", project_id
+            ).eq("file_type", "preview").maybeSingle().execute()
+            if preview.data and preview.data.get("storage_path"):
+                preview_path = r2._resolve(preview.data["storage_path"])
+                if preview_path.exists():
+                    file_url = preview.data["storage_path"]
+                    has_preview = True
+        except Exception:
+            pass
+        # 2) Fallback: check if preview.mp4 exists on disk next to source file
+        if not has_preview:
+            try:
+                source_path = r2._resolve(data["file_url"])
+                preview_sibling = source_path.parent / "preview.mp4"
+                if preview_sibling.exists():
+                    # Compute the storage key for this preview
+                    source_key = data["file_url"]
+                    preview_key = str(Path(source_key).parent / "preview.mp4").replace("\\", "/")
+                    file_url = preview_key
+                    has_preview = True
+                    # Register in DB so cleanup/retention can manage it
+                    try:
+                        preview_size = preview_sibling.stat().st_size
+                        profile = user.get("profile", {})
+                        plan_q = sb.table("subscription_plans").select("retention_days").eq(
+                            "id", profile.get("plan_id", "free")
+                        ).maybeSingle().execute()
+                        ret_days = plan_q.data.get("retention_days", 1) if plan_q.data else 1
+                        exp = (datetime.now(timezone.utc) + timedelta(days=ret_days)).isoformat()
+                        sb.table("stored_files").insert({
+                            "user_id": user["id"],
+                            "project_id": project_id,
+                            "file_type": "preview",
+                            "storage_path": preview_key,
+                            "file_size_bytes": preview_size,
+                            "cdn_url": r2.get_cdn_url(preview_key),
+                            "expires_at": exp,
+                        }).execute()
+                        logger.info("preview_registered_in_db", project_id=project_id, key=preview_key)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        data["video_url"] = f"/files/{file_url}"
+        # 3) If still no preview, check if source needs transcoding
+        if not has_preview:
+            try:
+                source_path = r2._resolve(data["file_url"])
+                if source_path.exists():
+                    data["needs_transcode"] = needs_web_transcode(str(source_path))
+            except Exception:
+                pass
     return data
+
+
+@router.post("/{project_id}/web-preview")
+def create_on_demand_web_preview(project_id: str, user: dict = Depends(get_current_user)):
+    """Create a browser-compatible MP4 preview for an existing project on demand.
+    This fixes audio playback for MKV/AVI files with DTS/AC3/FLAC audio codecs
+    that browsers cannot decode."""
+    sb = get_supabase_admin()
+    r2 = get_r2_storage()
+
+    result = sb.table("projects").select("*").eq("id", project_id).eq("user_id", user["id"]).single().execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = result.data
+    file_url = project.get("file_url")
+    if not file_url:
+        raise HTTPException(status_code=400, detail="No source file")
+
+    # Check if web preview already exists
+    try:
+        existing = sb.table("stored_files").select("storage_path").eq(
+            "project_id", project_id
+        ).eq("file_type", "preview").maybeSingle().execute()
+        if existing.data and existing.data.get("storage_path"):
+            preview_path = r2._resolve(existing.data["storage_path"])
+            if preview_path.exists():
+                return {"video_url": f"/files/{existing.data['storage_path']}", "cached": True}
+    except Exception:
+        pass
+
+    # Resolve source file
+    try:
+        source_path = r2._resolve(file_url)
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail="Source file not found on disk")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+    # Check if transcoding is needed
+    if not needs_web_transcode(str(source_path)):
+        # File is already browser-compatible, just return it
+        return {"video_url": f"/files/{file_url}", "cached": True}
+
+    # Create web preview
+    settings = get_settings()
+    work_dir = settings.temp_path / f"preview_{project_id}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        preview_out = work_dir / "preview.mp4"
+        create_web_preview(str(source_path), str(preview_out))
+
+        preview_key = r2.get_storage_key(user["id"], project_id, "source", "preview.mp4")
+        r2.upload_file(preview_key, str(preview_out), content_type="video/mp4")
+        preview_size = preview_out.stat().st_size
+
+        # Get retention from plan
+        try:
+            profile = user.get("profile", {})
+            plan = sb.table("subscription_plans").select("retention_days").eq(
+                "id", profile.get("plan_id", "free")
+            ).single().execute()
+            retention_days = plan.data.get("retention_days", 1) if plan.data else 1
+        except Exception:
+            retention_days = 1
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat()
+
+        sb.table("stored_files").insert({
+            "user_id": user["id"],
+            "project_id": project_id,
+            "file_type": "preview",
+            "storage_path": preview_key,
+            "file_size_bytes": preview_size,
+            "cdn_url": r2.get_cdn_url(preview_key),
+            "expires_at": expires_at,
+        }).execute()
+
+        logger.info("on_demand_web_preview_created", project_id=project_id, size=preview_size)
+        return {"video_url": f"/files/{preview_key}", "cached": False}
+
+    except Exception as e:
+        logger.error("on_demand_web_preview_failed", project_id=project_id, error=str(e))
+        # Fallback: return original file
+        return {"video_url": f"/files/{file_url}", "cached": True, "error": str(e)[:200]}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -152,10 +382,8 @@ def create_project(
         project_data["target_lang"] = target_lang
     sb.table("projects").insert(project_data).execute()
 
-    # --- 6. Increment daily job counter ---
-    sb.rpc("increment_daily_jobs", {"user_id_param": user["id"]})
-
-    # --- 7. Queue heavy processing in Celery (non-blocking + durable) ---
+    # --- 6. Queue heavy processing in Celery (non-blocking + durable) ---
+    celery_ok = False
     try:
         from app.workers.tasks import run_project_processing_task
         run_project_processing_task.delay(
@@ -166,11 +394,27 @@ def create_project(
             ext=ext,
             plan_data=plan_data,
         )
+        celery_ok = True
     except Exception as e:
-        logger.error("project_processing_enqueue_failed", project_id=project_id, error=str(e))
-        sb.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="Project processing could not be queued")
+        logger.warning("celery_unavailable_fallback_thread", project_id=project_id, error=str(e))
+        # Fallback: process in a background thread when Celery/Redis is unavailable
+        thread = threading.Thread(
+            target=_process_video_project,
+            kwargs={
+                "project_id": project_id,
+                "user_id": user["id"],
+                "local_path": str(local_path),
+                "work_dir": str(work_dir),
+                "ext": ext,
+                "plan_data": plan_data,
+            },
+            daemon=True,
+        )
+        thread.start()
+        celery_ok = True  # Thread started successfully
+
+    # --- 7. Increment daily job counter (only after successful enqueue) ---
+    sb.rpc("increment_daily_jobs", {"user_id_param": user["id"]})
 
     logger.info("project_upload_accepted", project_id=project_id, size=actual_size)
 
@@ -215,6 +459,8 @@ def _process_video_project(
             "duration_seconds": media_info["duration_seconds"],
             "video_codec": media_info["video_codec"],
             "audio_tracks": len(media_info["audio_tracks"]),
+            "width": media_info.get("width", 0),
+            "height": media_info.get("height", 0),
         }
         if detected_source:
             project_update["source_lang"] = detected_source
@@ -234,6 +480,32 @@ def _process_video_project(
             "expires_at": expires_at,
         }).execute()
 
+        # --- Create browser-compatible preview if needed (MKV/AVI audio fix) ---
+        preview_key = storage_key  # default: use source
+        if needs_web_transcode(local_path):
+            try:
+                preview_path = work_dir_path / "preview.mp4"
+                create_web_preview(local_path, str(preview_path))
+                preview_key = r2.get_storage_key(user_id, project_id, "source", "preview.mp4")
+                r2.upload_file(preview_key, str(preview_path), content_type="video/mp4")
+                preview_size = preview_path.stat().st_size
+                sb.table("stored_files").insert({
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "file_type": "preview",
+                    "storage_path": preview_key,
+                    "file_size_bytes": preview_size,
+                    "cdn_url": r2.get_cdn_url(preview_key),
+                    "expires_at": expires_at,
+                }).execute()
+                logger.info("web_preview_created", project_id=project_id, size=preview_size)
+            except Exception as e:
+                logger.warning("web_preview_failed", project_id=project_id, error=str(e))
+                preview_key = storage_key  # fallback to original
+
+        # IMPORTANT: file_url must ALWAYS point to original source (not preview)
+        # Preview is served via stored_files lookup in get_project endpoint
+        # Export task uses file_url as source — must be original quality
         sb.table("projects").update({"file_url": storage_key}).eq("id", project_id).execute()
 
         # --- Extract subtitles ---
@@ -311,7 +583,7 @@ def delete_project(project_id: str, user: dict = Depends(get_current_user)):
     if not project.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Delete all R2 files for this project
+    # Delete all local storage files for this project
     stored = sb.table("stored_files").select("storage_path").eq("project_id", project_id).execute()
     for f in (stored.data or []):
         try:
@@ -319,10 +591,7 @@ def delete_project(project_id: str, user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
-    # Delete stored_files records
-    sb.table("stored_files").delete().eq("project_id", project_id).execute()
-
-    # Cascade delete handles subtitle_files, jobs
+    # CASCADE handles subtitle_files, translation_jobs, export_jobs, stored_files
     sb.table("projects").delete().eq("id", project_id).execute()
 
     # Recalculate storage
@@ -422,8 +691,17 @@ def batch_update_subtitles(
     user: dict = Depends(get_current_user),
 ):
     """
-    Batch update translated texts. Reads the translated file, applies edits, and saves back.
-    Body: { "edits": { "<subtitle_file_id>_<line_number>": "new text", ... } }
+    Batch update translated texts AND/OR timing.
+    Body: {
+      "edits": {
+        "<subtitle_file_id>_<line_number>": {
+          "translated_text": "new text",   // optional
+          "start_time": "HH:MM:SS,mmm",   // optional
+          "end_time": "HH:MM:SS,mmm"      // optional
+        }
+        OR "<subtitle_file_id>_<line_number>": "new text"  // legacy string format
+      }
+    }
     """
     sb = get_supabase_admin()
     r2 = get_r2_storage()
@@ -435,13 +713,14 @@ def batch_update_subtitles(
     if not project.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    edits: dict[str, str] = updates.get("edits", {})
-    if not edits:
+    raw_edits = updates.get("edits", {})
+    if not raw_edits:
         return {"updated": 0}
 
-    # Group edits by subtitle_file_id
-    grouped: dict[str, dict[int, str]] = {}
-    for composite_id, text in edits.items():
+    # Normalize edits: support both string (legacy) and dict (new) formats
+    # grouped[sf_id][line_num] = {"translated_text": ..., "start_time": ..., "end_time": ...}
+    grouped: dict[str, dict[int, dict]] = {}
+    for composite_id, value in raw_edits.items():
         parts = composite_id.rsplit("_", 1)
         if len(parts) != 2:
             continue
@@ -450,7 +729,14 @@ def batch_update_subtitles(
             line_num = int(line_num_str)
         except ValueError:
             continue
-        grouped.setdefault(sf_id, {})[line_num] = text
+        if isinstance(value, str):
+            # Legacy format: just translated text
+            edit_data = {"translated_text": value}
+        elif isinstance(value, dict):
+            edit_data = value
+        else:
+            continue
+        grouped.setdefault(sf_id, {})[line_num] = edit_data
 
     updated_count = 0
 
@@ -463,6 +749,8 @@ def batch_update_subtitles(
         if not sub_file.data:
             logger.warning("batch_update_sf_not_found", sf_id=sf_id)
             continue
+
+        original_format = sub_file.data.get("format", "srt").lower()
 
         # Read original file to get timing info
         file_url = sub_file.data.get("file_url")
@@ -489,7 +777,7 @@ def batch_update_subtitles(
         if translated_url:
             try:
                 tr_data = r2.download(translated_url)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{original_format}") as tf:
                     tr_tmp = Path(tf.name)
                     tf.write(tr_data)
                 try:
@@ -501,37 +789,72 @@ def batch_update_subtitles(
                 logger.warning("batch_update_read_translated_failed", sf_id=sf_id, error=str(e))
 
         # Apply edits on top of existing translations
-        existing_translations.update(line_edits)
+        for ln, edit_data in line_edits.items():
+            if "translated_text" in edit_data:
+                existing_translations[ln] = edit_data["translated_text"]
 
-        # Build output lines
+        # Build output lines (apply timing edits from original)
         out_lines = []
+        has_timing_edits = False
         for line in original_lines:
             ln = line["line_number"]
+            edit = line_edits.get(ln, {})
+            start = edit.get("start_time", line["start_time"])
+            end = edit.get("end_time", line["end_time"])
+            if start != line["start_time"] or end != line["end_time"]:
+                has_timing_edits = True
             out_lines.append({
                 "line_number": ln,
-                "start_time": line["start_time"],
-                "end_time": line["end_time"],
+                "start_time": start,
+                "end_time": end,
                 "original_text": existing_translations.get(ln, line["original_text"]),
             })
 
-        # Write and save
+        # Write translated file
+        out_ext = f".{original_format}" if original_format in ("ass", "ssa") else ".srt"
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=out_ext) as tf:
                 tmp_out = Path(tf.name)
-            write_srt(out_lines, str(tmp_out), use_translated=False)
+
+            if original_format in ("ass", "ssa"):
+                from app.services.subtitle_parser import write_ass
+                write_ass(out_lines, str(tmp_out))
+            else:
+                write_srt(out_lines, str(tmp_out), use_translated=False)
 
             translated_key = r2.get_storage_key(
                 user["id"], project_id, "subtitle",
-                f"translated_{sf_id}.srt"
+                f"translated_{sf_id}{out_ext}"
             )
             with open(tmp_out, "rb") as f:
                 r2.upload(translated_key, f.read(), content_type="text/plain")
             tmp_out.unlink(missing_ok=True)
 
-            # Update subtitle_files record
             sb.table("subtitle_files").update({
                 "translated_file_url": translated_key,
             }).eq("id", sf_id).execute()
+
+            # If timing was edited, also update the original source file
+            if has_timing_edits:
+                orig_out_lines = []
+                for line in original_lines:
+                    ln = line["line_number"]
+                    edit = line_edits.get(ln, {})
+                    orig_out_lines.append({
+                        "line_number": ln,
+                        "start_time": edit.get("start_time", line["start_time"]),
+                        "end_time": edit.get("end_time", line["end_time"]),
+                        "original_text": line["original_text"],
+                    })
+                with tempfile.NamedTemporaryFile(delete=False, suffix=out_ext) as tf:
+                    tmp_orig = Path(tf.name)
+                if original_format in ("ass", "ssa"):
+                    write_ass(orig_out_lines, str(tmp_orig))
+                else:
+                    write_srt(orig_out_lines, str(tmp_orig), use_translated=False)
+                with open(tmp_orig, "rb") as f:
+                    r2.upload(file_url, f.read(), content_type="text/plain")
+                tmp_orig.unlink(missing_ok=True)
 
             updated_count += len(line_edits)
         except Exception as e:
@@ -720,7 +1043,5 @@ def export_srt(
 
 
 def _recalculate_user_storage(sb, user_id: str):
-    """Recalculate total storage used from stored_files."""
-    result = sb.table("stored_files").select("file_size_bytes").eq("user_id", user_id).eq("uploaded_to_user_storage", False).execute()
-    total = sum(f.get("file_size_bytes", 0) for f in (result.data or []))
-    sb.table("profiles").update({"storage_used_bytes": total}).eq("id", user_id).execute()
+    """Delegate to shared helper in cleanup module."""
+    recalculate_user_storage(sb, user_id)

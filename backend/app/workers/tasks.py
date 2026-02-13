@@ -2,7 +2,6 @@ import time
 import shutil
 import asyncio
 import tempfile
-import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import structlog
@@ -11,33 +10,13 @@ from app.workers.celery_app import celery_app
 from app.core.supabase import get_supabase_admin
 from app.core.config import get_settings
 from app.services.translation import get_engine
-from app.services.subtitle_parser import parse_subtitle_file, write_srt
-from app.utils.ffmpeg import burn_subtitles, mux_subtitles
+from app.services.subtitle_parser import parse_subtitle_file, write_srt, write_ass
+from app.utils.ffmpeg import burn_subtitles, mux_subtitles, CODEC_MAP
 from app.services.storage import get_r2_storage
 from app.services.cleanup import cleanup_expired_files
+from app.utils.chunking import build_chunks, apply_glossary_pre, apply_glossary_post, OVERLAP_LINES
 
 logger = structlog.get_logger()
-
-CHAR_LIMIT_SINGLE = 35_000
-CHAR_LIMIT_MEDIUM = 60_000
-MAX_LINES_PER_BLOCK = 300
-OVERLAP_LINES = 20
-CODEC_MAP = {"h264": "libx264", "h265": "libx265", "vp9": "libvpx-vp9", "av1": "libaom-av1", "copy": "copy"}
-
-
-def _build_chunks_celery(lines: list[dict]) -> list[list[dict]]:
-    """Split subtitle lines into chunks based on character limits."""
-    total_chars = sum(len(l.get("original_text", "")) for l in lines)
-    if total_chars <= CHAR_LIMIT_SINGLE:
-        return [lines]
-    block_size = min(350, max(200, len(lines) // 2)) if total_chars <= CHAR_LIMIT_MEDIUM else MAX_LINES_PER_BLOCK
-    chunks = []
-    i = 0
-    while i < len(lines):
-        end = min(i + block_size, len(lines))
-        chunks.append(lines[i:end])
-        i = end - OVERLAP_LINES if end < len(lines) else end
-    return chunks
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=30)
@@ -53,6 +32,7 @@ def run_translation_task(
     context_enabled: bool = True,
     glossary_enabled: bool = False,
     subtitle_file_id: str | None = None,
+    model_id: str = "",
 ):
     """Celery task: translate subtitle file and save translated file."""
     sb = get_supabase_admin()
@@ -84,14 +64,14 @@ def run_translation_task(
             return {"status": "completed", "lines": 0}
 
         total_lines = len(all_lines)
-        engine = get_engine(engine_id, api_key)
+        engine = get_engine(engine_id, api_key, model_id)
 
         glossary = {}
         if glossary_enabled:
             g_result = sb.table("glossary_terms").select("*").eq("user_id", user_id).eq("source_lang", source_lang).eq("target_lang", target_lang).execute()
             glossary = {t["source_term"]: t["target_term"] for t in (g_result.data or [])}
 
-        chunks = _build_chunks_celery(all_lines)
+        chunks = build_chunks(all_lines)
         translated_map: dict[int, str] = {}
         context_lines: list[str] = []
         start_time = time.time()
@@ -102,18 +82,29 @@ def run_translation_task(
                 sb.table("projects").update({"status": "ready"}).eq("id", project_id).execute()
                 return {"status": "cancelled"}
 
+            # Determine how many overlap (context-only) lines are in this chunk
+            # First chunk has no overlap; subsequent chunks have OVERLAP_LINES
+            overlap_count = OVERLAP_LINES if chunk_idx > 0 else 0
+            # Clamp: if chunk is smaller than overlap, no overlap
+            overlap_count = min(overlap_count, len(chunk) - 1) if overlap_count else 0
+
             texts = [line["original_text"] for line in chunk]
             if glossary:
-                texts = [_apply_glossary(t, glossary) for t in texts]
+                texts = [apply_glossary_pre(t, glossary) for t in texts]
 
-            ctx = context_lines[-OVERLAP_LINES:] if context_enabled and context_lines else None
+            ctx = context_lines[-10:] if context_enabled and context_lines else None
 
-            translated = loop.run_until_complete(engine.translate_batch(texts, source_lang, target_lang, ctx))
+            translated = loop.run_until_complete(
+                engine.translate_batch(texts, source_lang, target_lang, ctx, overlap_count)
+            )
 
             if glossary:
-                translated = [re.sub(r'\[=[^\]]+\]', '', t).strip() for t in translated]
+                translated = [apply_glossary_post(t) for t in translated]
 
-            for j, line in enumerate(chunk):
+            # The engine returns only the NEW lines (overlap lines are stripped).
+            # Map them to the non-overlap portion of the chunk.
+            new_lines = chunk[overlap_count:]
+            for j, line in enumerate(new_lines):
                 ln = line["line_number"]
                 if j < len(translated) and translated[j] and ln not in translated_map:
                     translated_map[ln] = translated[j]
@@ -123,16 +114,23 @@ def run_translation_task(
             sb.table("translation_jobs").update({"progress": progress, "translated_lines": len(translated_map)}).eq("id", job_id).execute()
             self.update_state(state="PROGRESS", meta={"progress": progress})
 
-        # Build and save translated file
+        # Build and save translated file (preserve original format: .ass or .srt)
+        original_format = sub_file.data.get("format", "srt").lower()
         translated_lines_out = [{
             "line_number": l["line_number"], "start_time": l["start_time"],
             "end_time": l["end_time"], "original_text": translated_map.get(l["line_number"], l["original_text"]),
         } for l in all_lines]
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tf:
+        out_ext = f".{original_format}" if original_format in ("ass", "ssa") else ".srt"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=out_ext) as tf:
             tmp_out = Path(tf.name)
-        write_srt(translated_lines_out, str(tmp_out), use_translated=False)
-        translated_key = storage.get_storage_key(user_id, project_id, "subtitle", f"translated_{subtitle_file_id}.srt")
+
+        if original_format in ("ass", "ssa"):
+            write_ass(translated_lines_out, str(tmp_out))
+        else:
+            write_srt(translated_lines_out, str(tmp_out), use_translated=False)
+
+        translated_key = storage.get_storage_key(user_id, project_id, "subtitle", f"translated_{subtitle_file_id}{out_ext}")
         with open(tmp_out, "rb") as f:
             storage.upload(translated_key, f.read(), content_type="text/plain")
         tmp_out.unlink(missing_ok=True)
@@ -157,9 +155,29 @@ def run_translation_task(
         logger.info("translation_completed", job_id=job_id, lines=total_lines, chunks=len(chunks), elapsed_ms=elapsed_ms)
         return {"status": "completed", "lines": total_lines, "elapsed_ms": elapsed_ms}
 
+    except ValueError as e:
+        # Non-retryable errors (model not found, invalid API key, etc.)
+        error_msg = str(e)[:500]
+        logger.error("translation_failed_permanent", job_id=job_id, error=error_msg)
+        sb.table("translation_jobs").update({"status": "failed", "error_message": error_msg}).eq("id", job_id).execute()
+        sb.table("projects").update({"status": "ready"}).eq("id", project_id).execute()
+        return {"status": "failed", "error": error_msg}
     except Exception as e:
-        logger.error("translation_failed", job_id=job_id, error=str(e))
-        sb.table("translation_jobs").update({"status": "failed", "error_message": str(e)[:500]}).eq("id", job_id).execute()
+        # Extract meaningful error message from RetryError/tenacity wrappers
+        error_msg = str(e)[:500]
+        if "RetryError" in error_msg:
+            try:
+                inner = e.__cause__ or e.__context__
+                if inner:
+                    error_msg = str(inner)[:500]
+            except Exception:
+                pass
+            if "404" in error_msg or "Not Found" in error_msg:
+                error_msg = f"Model bulunamadı. Lütfen geçerli bir model seçin. ({error_msg[:200]})"
+            elif "401" in error_msg or "auth" in error_msg.lower():
+                error_msg = "API anahtarı geçersiz. Lütfen ayarlardan kontrol edin."
+        logger.error("translation_failed", job_id=job_id, error=error_msg)
+        sb.table("translation_jobs").update({"status": "failed", "error_message": error_msg}).eq("id", job_id).execute()
         sb.table("projects").update({"status": "ready"}).eq("id", project_id).execute()
         raise self.retry(exc=e)
     finally:
@@ -177,6 +195,7 @@ def run_export_task(
     video_codec: str,
     audio_codec: str,
     watermark_text: str | None = None,
+    watermark_position: str = "bottom-right",
     subtitle_style: dict | None = None,
 ):
     """Celery task: export video with burned/muxed subtitles."""
@@ -198,8 +217,8 @@ def run_export_task(
         try:
             sb.table("export_jobs").update({"progress": overall}).eq("id", job_id).execute()
             self.update_state(state="PROGRESS", meta={"progress": overall})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("export_progress_update_failed", job_id=job_id, progress=overall, error=str(e))
 
     try:
         sb.table("export_jobs").update({
@@ -230,7 +249,9 @@ def run_export_task(
             raise RuntimeError("No translated subtitle file found")
 
         sub_data = r2.download(translated_url)
-        sub_path = work_dir / "translated.srt"
+        # Preserve original subtitle format extension (could be .ass, .ssa, .srt, .vtt)
+        sub_ext = Path(translated_url).suffix or ".srt"
+        sub_path = work_dir / f"translated{sub_ext}"
         sub_path.write_bytes(sub_data)
 
         sb.table("export_jobs").update({"progress": 30}).eq("id", job_id).execute()
@@ -256,6 +277,7 @@ def run_export_task(
                 video_codec=ffmpeg_codec,
                 audio_codec="copy" if audio_codec == "copy" else audio_codec,
                 watermark_text=watermark_text,
+                watermark_position=watermark_position,
                 subtitle_style=subtitle_style,
                 progress_callback=_update_progress,
             )
@@ -366,8 +388,3 @@ def cleanup_expired_files_task():
     return {"deleted": deleted}
 
 
-def _apply_glossary(text: str, glossary: dict) -> str:
-    for src, tgt in glossary.items():
-        if src in text:
-            text = text.replace(src, f"{src}[={tgt}]")
-    return text

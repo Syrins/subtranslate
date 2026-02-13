@@ -28,6 +28,7 @@ class EngineType(str, Enum):
     openai = "openai"
     deepl = "deepl"
     gemini = "gemini"
+    openrouter = "openrouter"
 
 
 class ExportMode(str, Enum):
@@ -54,6 +55,7 @@ class TranslationJobCreate(BaseModel):
     project_id: str
     subtitle_file_id: Optional[str] = None
     engine: EngineType = EngineType.openai
+    model_id: Optional[str] = None
     source_lang: str
     target_lang: str
     context_enabled: bool = True
@@ -64,10 +66,11 @@ class ExportJobCreate(BaseModel):
     project_id: str
     mode: ExportMode = ExportMode.burn_in
     resolution: str = "original"
-    video_codec: VideoCodec = VideoCodec.h264
-    audio_codec: str = "aac"
+    video_codec: VideoCodec = VideoCodec.copy
+    audio_codec: str = "copy"
     include_watermark: bool = False
     watermark_text: Optional[str] = None
+    watermark_position: str = "bottom-right"
     keep_audio_tracks: bool = True
     upload_to_storage: bool = False
     subtitle_style: Optional[dict] = None

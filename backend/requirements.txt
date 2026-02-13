@@ -20,6 +20,9 @@ deepl>=1.18.0
 pysubs2>=1.7.0
 chardet>=5.2.0
 
+# S3-compatible storage (Cloudflare R2, Backblaze B2)
+boto3>=1.35.0
+
 # Utils
 pydantic>=2.10.0
 pydantic-settings>=2.7.0

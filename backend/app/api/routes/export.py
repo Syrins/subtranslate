@@ -9,14 +9,12 @@ from app.core.security import get_current_user
 from app.core.supabase import get_supabase_admin
 from app.core.config import get_settings
 from app.models.schemas import ExportJobCreate
-from app.utils.ffmpeg import burn_subtitles, mux_subtitles
+from app.utils.ffmpeg import burn_subtitles, mux_subtitles, CODEC_MAP
 from app.services.storage import get_r2_storage
-from app.services.cleanup import mark_uploaded_to_user_storage
+from app.services.cleanup import mark_uploaded_to_user_storage, recalculate_user_storage
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/export", tags=["Export"])
-
-CODEC_MAP = {"h264": "libx264", "h265": "libx265", "vp9": "libvpx-vp9", "av1": "libaom-av1", "copy": "copy"}
 
 
 @router.post("")
@@ -51,7 +49,7 @@ def create_export_job(
             body.watermark_text = body.watermark_text or "SubTranslate"
 
     job_id = str(uuid.uuid4())
-    sb.table("export_jobs").insert({
+    job_row = {
         "id": job_id,
         "project_id": body.project_id,
         "user_id": user["id"],
@@ -63,7 +61,8 @@ def create_export_job(
         "watermark_text": body.watermark_text,
         "keep_audio_tracks": body.keep_audio_tracks,
         "status": "queued",
-    }).execute()
+    }
+    sb.table("export_jobs").insert(job_row).execute()
 
     sb.table("projects").update({"status": "exporting"}).eq("id", body.project_id).execute()
 
@@ -78,18 +77,51 @@ def create_export_job(
             video_codec=body.video_codec.value,
             audio_codec=body.audio_codec,
             watermark_text=body.watermark_text if body.include_watermark else None,
+            watermark_position=body.watermark_position,
             subtitle_style=body.subtitle_style,
         )
     except Exception as e:
-        logger.error("export_enqueue_failed", job_id=job_id, error=str(e))
-        sb.table("export_jobs").update({
-            "status": "failed",
-            "error_message": "Queue dispatch failed",
-        }).eq("id", job_id).execute()
-        sb.table("projects").update({"status": "translated"}).eq("id", body.project_id).execute()
-        raise HTTPException(status_code=500, detail="Export job could not be queued")
+        logger.warning("celery_unavailable_export_fallback_thread", job_id=job_id, error=str(e))
+        # Fallback: run in background thread when Celery/Redis is unavailable
+        import threading
+        thread = threading.Thread(
+            target=_run_export,
+            kwargs={
+                "job_id": job_id,
+                "project_id": body.project_id,
+                "user_id": user["id"],
+                "mode": body.mode.value,
+                "resolution": body.resolution,
+                "video_codec": body.video_codec.value,
+                "audio_codec": body.audio_codec,
+                "watermark_text": body.watermark_text if body.include_watermark else None,
+                "watermark_position": body.watermark_position,
+                "subtitle_style": body.subtitle_style,
+            },
+            daemon=True,
+        )
+        thread.start()
 
     return {"id": job_id, "status": "queued"}
+
+
+@router.get("/active/{project_id}")
+def get_active_export_job(project_id: str, user: dict = Depends(get_current_user)):
+    """Get the active (queued/processing) export job for a project, if any."""
+    sb = get_supabase_admin()
+    result = (
+        sb.table("export_jobs")
+        .select("*")
+        .eq("project_id", project_id)
+        .eq("user_id", user["id"])
+        .in_("status", ["queued", "processing"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not result.data or len(result.data) == 0:
+        return None
+    return result.data[0]
 
 
 @router.get("/{job_id}")
@@ -135,6 +167,53 @@ def cancel_export_job(job_id: str, user: dict = Depends(get_current_user)):
     return {"status": "cancelled"}
 
 
+@router.delete("/previous/{project_id}")
+def delete_previous_export(project_id: str, user: dict = Depends(get_current_user)):
+    """Delete previous export files for a project before re-exporting."""
+    sb = get_supabase_admin()
+    r2 = get_r2_storage()
+
+    # Verify project ownership
+    project = sb.table("projects").select("id, status").eq("id", project_id).eq("user_id", user["id"]).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Find completed export jobs for this project
+    jobs = (
+        sb.table("export_jobs")
+        .select("id, output_file_url")
+        .eq("project_id", project_id)
+        .eq("user_id", user["id"])
+        .eq("status", "completed")
+        .execute()
+    )
+
+    deleted_files = 0
+    for job in (jobs.data or []):
+        # Delete from R2 storage
+        if job.get("output_file_url"):
+            try:
+                r2.delete(job["output_file_url"])
+                deleted_files += 1
+            except Exception as e:
+                logger.warning("export_file_delete_failed", key=job["output_file_url"], error=str(e))
+
+        # Delete the old export job record
+        sb.table("export_jobs").delete().eq("id", job["id"]).execute()
+
+    # Delete stored_files records for export_video type
+    sb.table("stored_files").delete().eq("project_id", project_id).eq("user_id", user["id"]).eq("file_type", "export_video").execute()
+
+    # Reset project status back to translated
+    if project.data.get("status") == "exported":
+        sb.table("projects").update({"status": "translated"}).eq("id", project_id).execute()
+
+    # Recalculate storage
+    _recalculate_user_storage(sb, user["id"])
+
+    return {"deleted_files": deleted_files, "message": "Önceki dışa aktarma dosyaları silindi."}
+
+
 @router.post("/{project_id}/uploaded-to-own-storage")
 def notify_uploaded_to_own_storage(project_id: str, user: dict = Depends(get_current_user)):
     """User uploaded export to their own Cloudflare/Backblaze — delete from our R2."""
@@ -156,6 +235,7 @@ def _run_export(
     video_codec: str,
     audio_codec: str,
     watermark_text: str | None,
+    watermark_position: str = "bottom-right",
     subtitle_style: dict | None = None,
 ):
     """Sync background task: export video with subtitles. Runs in a separate thread."""
@@ -214,7 +294,9 @@ def _run_export(
             raise RuntimeError("No translated subtitle file found")
 
         sub_data = r2.download(translated_url)
-        sub_path = work_dir / "translated.srt"
+        # Preserve original subtitle format extension (could be .ass, .ssa, .srt, .vtt)
+        sub_ext = Path(translated_url).suffix or ".srt"
+        sub_path = work_dir / f"translated{sub_ext}"
         sub_path.write_bytes(sub_data)
 
         sb.table("export_jobs").update({"progress": 30}).eq("id", job_id).execute()
@@ -242,6 +324,7 @@ def _run_export(
                 video_codec=ffmpeg_codec,
                 audio_codec="copy" if audio_codec == "copy" else audio_codec,
                 watermark_text=watermark_text,
+                watermark_position=watermark_position,
                 subtitle_style=subtitle_style,
                 progress_callback=_update_progress,
             )
@@ -319,7 +402,5 @@ def _run_export(
 
 
 def _recalculate_user_storage(sb, user_id: str):
-    """Recalculate total storage used from stored_files."""
-    result = sb.table("stored_files").select("file_size_bytes").eq("user_id", user_id).eq("uploaded_to_user_storage", False).execute()
-    total = sum(f.get("file_size_bytes", 0) for f in (result.data or []))
-    sb.table("profiles").update({"storage_used_bytes": total}).eq("id", user_id).execute()
+    """Delegate to shared helper in cleanup module."""
+    recalculate_user_storage(sb, user_id)

@@ -1,15 +1,28 @@
 services:
-  # ─── Redis ───────────────────────────────────────────
+  # ─── Redis (internal only — no external network exposure) ──
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${SERVICE_PASSWORD_REDIS}
+    environment:
+      - SERVICE_PASSWORD_REDIS
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${SERVICE_PASSWORD_REDIS}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
     restart: unless-stopped
 
   # ─── Backend API ─────────────────────────────────────
@@ -19,7 +32,7 @@ services:
       - SUPABASE_URL=${SUPABASE_URL:?}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379/0
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
       - R2_ENDPOINT=${R2_ENDPOINT:-}
@@ -39,22 +52,30 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "3"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 1G
     restart: unless-stopped
 
-  # ─── Celery Worker ───────────────────────────────────
+  # ─── Celery Worker (FFmpeg: 6 threads per task) ─────
   celery-worker:
     build: ./backend
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=50
     environment:
       - SUPABASE_URL=${SUPABASE_URL:?}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379/0
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
       - R2_ENDPOINT=${R2_ENDPOINT:-}
@@ -71,6 +92,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "6"
+          memory: 16G
+        reservations:
+          cpus: "2"
+          memory: 4G
     exclude_from_hc: true
     restart: unless-stopped
 
@@ -82,15 +111,22 @@ services:
       - SUPABASE_URL=${SUPABASE_URL:?}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:?}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:?}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379/0
       - STORAGE_DIR=/app/storage
     depends_on:
       redis:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     exclude_from_hc: true
     restart: unless-stopped
 
-  # ─── Frontend ────────────────────────────────────────
+  # ─── Frontend (Next.js standalone) ──────────────────
   frontend:
     build:
       context: ./frontend
@@ -102,11 +138,19 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      test: ["CMD", "curl", "-sf", "http://localhost:3000"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
     restart: unless-stopped
 
 volumes:

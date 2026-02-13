@@ -260,10 +260,13 @@ docker-compose restart backend
   - [ ] Workers depend on Redis (healthy)
   - [ ] Frontend depends on Backend (healthy)
 
-- [ ] **Ports Exposed:**
+- [ ] **Container Ports:**
   - [ ] Backend: 8000
   - [ ] Frontend: 3000
   - [ ] Redis: 6379 (internal only)
+- [ ] **Host Port Publish (Optional):**
+  - [ ] Only publish when direct host access is required
+  - [ ] Use unique host ports per app (avoid collisions like `0.0.0.0:3000`)
 
 ---
 

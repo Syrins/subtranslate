@@ -23,21 +23,28 @@ Pipeline stages:
 ## 3. Chunking Strategy
 
 Core constants:
-- `CHAR_LIMIT_SINGLE = 35000`
-- `CHAR_LIMIT_MEDIUM = 60000`
-- `MAX_LINES_PER_BLOCK = 300`
-- `OVERLAP_LINES = 20`
+- `CHAR_LIMIT_SAFE_CAP = 12000` — safety cap for API request size
+- `MAX_LINES_PER_BLOCK = 80` — optimal line count per chunk (prevents LLM desync)
+- `OVERLAP_LINES = 20` — context overlap between chunks
+- `MIN_LINES_FOR_SPLIT = 100` — below this, send as single chunk
 
 Rules:
-- small content -> single chunk
-- medium content -> block-based chunks
-- large content -> capped line blocks
-- overlap lines preserve context continuity
+- **Line count is the primary splitting criterion**, not character count
+- Small files (≤100 lines AND ≤12K chars) → single chunk
+- Larger files → sliding window with 80-line blocks and 20-line overlap
+- Character cap is a safety net only (shrinks block if exceeded)
+
+Overlap handling:
+- First chunk: no overlap, all lines are translated
+- Subsequent chunks: first 20 lines are context-only (from previous block)
+- The AI is instructed to NOT translate overlap lines (prompt engineering)
+- Post-processing safety net strips overlap if the model ignores the instruction
+- `translated_map` deduplication ensures no line is written twice
 
 Goals:
-- avoid token/request limits
-- maintain translation consistency
-- improve reliability on large files
+- prevent LLM line drift / desynchronization on long files
+- maintain character voice and tone consistency across chunks
+- stay within token/request limits
 
 ## 4. Supported AI Engines
 
@@ -58,15 +65,25 @@ Goals:
 
 ## 5. Prompt and Output Contract
 
-Prompt pattern:
-- input lines are numbered (`1.`, `2.`, ...)
-- model is instructed to return translation only
-- same numbering semantics are expected
+### System Prompt (Adaptive Localization)
+The system prompt teaches the AI *how to think* about translation rather than giving fixed rules:
+- **Power dynamics analysis** — detect dominant/submissive/equal speakers
+- **Emotional temperature matching** — romantic vs intense vs comedy
+- **Character voice consistency** — infer character type from context
+- **Fluidity over literalism** — adapt idioms, never translate literally
+- Technical rules: preserve numbering, ASS tags, stutters, sound effects
 
-Output parsing:
+### Overlap-Aware User Message
+For chunks after the first:
+- Previous translated lines are provided as tone/character reference
+- Overlap lines are explicitly marked as "CONTEXT ONLY — do NOT translate"
+- The AI is told to start output from line N+1
+
+### Output Parsing
 - `_parse_numbered_response` extracts translated lines
-- pads missing lines with empty strings
-- trims overflow lines
+- **Post-processing safety net**: if model ignores overlap instruction and translates all lines, the first N overlap lines are stripped automatically
+- Pads missing lines with empty strings
+- Trims overflow lines
 
 This keeps output length aligned with expected subtitle line count.
 

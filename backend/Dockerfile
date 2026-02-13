@@ -1,15 +1,15 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# System deps (curl for healthcheck)
+# System deps (curl for healthcheck, fontconfig for subtitle fonts)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    curl fontconfig fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Python deps (cached layer — only rebuilds when requirements.txt changes)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-warn-script-location -r requirements.txt
 
 # Pre-download ffmpeg + ffprobe static binaries (cached in image)
 RUN python -c "import static_ffmpeg; static_ffmpeg.run.get_or_fetch_platform_executables_else_raise(); print('ffmpeg+ffprobe downloaded')"
@@ -17,14 +17,21 @@ RUN python -c "import static_ffmpeg; static_ffmpeg.run.get_or_fetch_platform_exe
 # App code
 COPY . .
 
-# Create persistent directories
-RUN mkdir -p /app/tmp /app/storage
+# Non-root user for security
+RUN groupadd --system --gid 1001 appuser \
+    && useradd --system --uid 1001 --gid appuser appuser \
+    && mkdir -p /app/tmp /app/storage \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 # Default env vars (overridden by Coolify/docker-compose)
-ENV HOST=0.0.0.0
-ENV PORT=8000
-ENV TEMP_DIR=/app/tmp
-ENV STORAGE_DIR=/app/storage
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    TEMP_DIR=/app/tmp \
+    STORAGE_DIR=/app/storage \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000
 

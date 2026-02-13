@@ -118,11 +118,12 @@ export default function ProjectsPage() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">Tümü</SelectItem>
-            <SelectItem value="uploading">Yükleniyor</SelectItem>
+            <SelectItem value="ready">Hazır</SelectItem>
+            <SelectItem value="translating">Çevriliyor</SelectItem>
             <SelectItem value="translated">Çevrildi</SelectItem>
-            <SelectItem value="editing">Düzenleniyor</SelectItem>
             <SelectItem value="exporting">Dışa Aktarılıyor</SelectItem>
-            <SelectItem value="done">Tamamlandı</SelectItem>
+            <SelectItem value="exported">Tamamlandı</SelectItem>
+            <SelectItem value="failed">Hata</SelectItem>
           </SelectContent>
         </Select>
       </div>

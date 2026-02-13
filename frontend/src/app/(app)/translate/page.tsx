@@ -15,6 +15,9 @@ import {
   AlertTriangle,
   Key,
   Lock,
+  Search,
+  ChevronsUpDown,
+  Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,18 +30,64 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { api, type Project, type SubtitleLine, type SubtitleTrack, type TranslationJob } from "@/lib/api";
+import { api, type SubtitleLine, type SubtitleTrack } from "@/lib/api";
 import { useAuthContext } from "@/components/auth-provider";
 import { createClient } from "@/lib/supabase/client";
 import { toast } from "sonner";
 
 const ALL_ENGINES = [
-  { id: "openai", name: "OpenAI GPT-4", description: "En yüksek kalite, bağlam duyarlı çeviri", badge: "Önerilen" },
-  { id: "deepl", name: "DeepL Pro", description: "Hızlı ve doğal çeviri", badge: "Hızlı" },
-  { id: "gemini", name: "Google Gemini", description: "Çok dilli destek, uygun fiyat", badge: "Ekonomik" },
+  {
+    id: "openai", name: "OpenAI", description: "GPT-5, GPT-4.1 ve diğer modeller", badge: "Önerilen",
+    allowCustomModel: false,
+    models: [
+      { id: "gpt-4.1-mini", label: "GPT-4.1 Mini (Önerilen)" },
+      { id: "gpt-4.1", label: "GPT-4.1" },
+      { id: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
+      { id: "gpt-4o", label: "GPT-4o" },
+      { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+      { id: "gpt-5-nano", label: "GPT-5 Nano" },
+      { id: "gpt-5-mini", label: "GPT-5 Mini" },
+      { id: "gpt-5", label: "GPT-5" },
+      { id: "gpt-5.2", label: "GPT-5.2" },
+    ],
+  },
+  {
+    id: "openrouter", name: "OpenRouter", description: "Yüzlerce modele tek API ile erişin", badge: "Çok Model",
+    allowCustomModel: true,
+    models: [
+      { id: "openai/gpt-4.1-mini", label: "OpenAI GPT-4.1 Mini" },
+      { id: "openai/gpt-4.1", label: "OpenAI GPT-4.1" },
+      { id: "openai/gpt-4o", label: "OpenAI GPT-4o" },
+      { id: "openai/gpt-4o-mini", label: "OpenAI GPT-4o Mini" },
+      { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4" },
+      { id: "anthropic/claude-3.5-sonnet", label: "Claude 3.5 Sonnet" },
+      { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+      { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+      { id: "deepseek/deepseek-chat-v3", label: "DeepSeek V3" },
+      { id: "meta-llama/llama-4-maverick", label: "Llama 4 Maverick" },
+    ],
+  },
+  {
+    id: "gemini", name: "Google Gemini", description: "Gemini 2.5 ve 3 modelleri", badge: "Ekonomik",
+    allowCustomModel: false,
+    models: [
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash (Önerilen)" },
+      { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite" },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+      { id: "gemini-3-flash-preview", label: "Gemini 3 Flash (Preview)" },
+      { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (Preview)" },
+    ],
+  },
+  {
+    id: "deepl", name: "DeepL Pro", description: "Hızlı ve doğal çeviri", badge: "Hızlı",
+    allowCustomModel: false,
+    models: [],
+  },
 ];
 
 export default function TranslatePage() {
@@ -53,18 +102,20 @@ function TranslatePageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const projectId = searchParams.get("project");
-  const { plan } = useAuthContext();
+  const { plan, loading: authLoading } = useAuthContext();
   const supabase = createClient();
 
-  const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState(projectId || "");
-  const [project, setProject] = useState<Project | null>(null);
   const [allSubtitles, setAllSubtitles] = useState<SubtitleLine[]>([]);
   const [tracks, setTracks] = useState<SubtitleTrack[]>([]);
   const [selectedTrackId, setSelectedTrackId] = useState<string>("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(Boolean(projectId));
 
   const [selectedEngine, setSelectedEngine] = useState("openai");
+  const [selectedModel, setSelectedModel] = useState("");
+  const [customModel, setCustomModel] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
+  const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
   const [targetLang, setTargetLang] = useState("tr");
   const [glossaryEnabled, setGlossaryEnabled] = useState(false);
   const [contextEnabled, setContextEnabled] = useState(true);
@@ -91,13 +142,22 @@ function TranslatePageInner() {
   }, [tracks, selectedTrackId]);
 
   // Load projects list (refreshes on navigation back)
-  const { data: fetchedProjects } = useFetchOnFocus(
+  const {
+    data: fetchedProjects,
+    loading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useFetchOnFocus(
     () => api.listProjects(),
-    { pathPrefix: "/translate" }
+    { pathPrefix: "/translate", dedupMs: 0 }
   );
+  const projects = fetchedProjects ?? [];
+
   useEffect(() => {
-    if (fetchedProjects) setProjects(fetchedProjects);
-  }, [fetchedProjects]);
+    if (!authLoading) {
+      refetchProjects();
+    }
+  }, [authLoading, refetchProjects]);
 
   // Load user API keys
   useEffect(() => {
@@ -111,28 +171,34 @@ function TranslatePageInner() {
         setUserApiKeys(map);
       });
     });
-  }, []);
+  }, [supabase]);
 
-  // Load selected project + subtitles + tracks
-  useEffect(() => {
-    if (!selectedProjectId) { setLoading(false); return; }
+  const loadSelectedProjectData = useCallback(async (pid: string) => {
     setLoading(true);
-    Promise.all([
-      api.getProject(selectedProjectId),
-      api.getSubtitles(selectedProjectId),
-      api.getSubtitleTracks(selectedProjectId),
-    ]).then(([proj, subs, trks]) => {
-      setProject(proj);
+    try {
+      const [proj, subs, trks] = await Promise.all([
+        api.getProject(pid),
+        api.getSubtitles(pid),
+        api.getSubtitleTracks(pid),
+      ]);
       setAllSubtitles(subs);
       setTracks(trks);
-      // Auto-select first track
       if (trks.length > 0) {
         setSelectedTrackId(trks[0].id);
       }
       if (proj.target_lang) setTargetLang(proj.target_lang);
-    }).catch(() => toast.error("Proje yüklenemedi."))
-      .finally(() => setLoading(false));
-  }, [selectedProjectId]);
+    } catch {
+      toast.error("Proje yüklenemedi.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Load selected project + subtitles + tracks
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    void loadSelectedProjectData(selectedProjectId);
+  }, [selectedProjectId, loadSelectedProjectData]);
 
   // Poll job status
   const startPolling = useCallback((jid: string) => {
@@ -146,13 +212,9 @@ function TranslatePageInner() {
           clearInterval(pollRef.current!);
           pollRef.current = null;
           toast.success("Çeviri tamamlandı!");
-          // Refresh both subtitles and project data
-          const [subs, proj] = await Promise.all([
-            api.getSubtitles(selectedProjectId),
-            api.getProject(selectedProjectId),
-          ]);
+          // Refresh subtitles after translation
+          const subs = await api.getSubtitles(selectedProjectId);
           setAllSubtitles(subs);
-          setProject(proj);
         } else if (job.status === "failed") {
           clearInterval(pollRef.current!);
           pollRef.current = null;
@@ -170,10 +232,12 @@ function TranslatePageInner() {
     if (!track) return;
 
     try {
+      const resolvedModel = selectedModel === "_custom" ? customModel : selectedModel;
       const result = await api.createTranslationJob({
         project_id: selectedProjectId,
         subtitle_file_id: selectedTrackId,
-        engine: selectedEngine as "openai" | "deepl" | "gemini",
+        engine: selectedEngine as "openai" | "deepl" | "gemini" | "openrouter",
+        model_id: resolvedModel || undefined,
         source_lang: track.language,
         target_lang: targetLang,
         context_enabled: contextEnabled,
@@ -207,6 +271,40 @@ function TranslatePageInner() {
   const canUseEngine = hasUserKey || !isFreePlan;
 
   if (!selectedProjectId) {
+    if (authLoading || (projectsLoading && fetchedProjects === undefined)) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        </div>
+      );
+    }
+
+    if (projectsError) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6">
+          <AlertTriangle className="h-12 w-12 text-destructive" />
+          <h2 className="text-xl font-bold">Projeler yuklenemedi</h2>
+          <p className="text-sm text-muted-foreground">Lutfen tekrar deneyin.</p>
+          <Button onClick={() => refetchProjects()}>
+            Tekrar Dene
+          </Button>
+        </div>
+      );
+    }
+
+    if (projects.length === 0) {
+      return (
+        <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6 text-center">
+          <FolderOpen className="h-12 w-12 text-muted-foreground" />
+          <h2 className="text-xl font-bold">Henuz proje yok</h2>
+          <p className="text-muted-foreground">Ceviriye baslamak icin once bir proje olusturun.</p>
+          <Button onClick={() => router.push("/upload")}>
+            Proje Olustur
+          </Button>
+        </div>
+      );
+    }
+
     return (
       <div className="flex h-[calc(100vh-3rem)] flex-col items-center justify-center gap-4 p-6">
         <FolderOpen className="h-12 w-12 text-muted-foreground" />
@@ -225,9 +323,9 @@ function TranslatePageInner() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-3rem)] flex-col overflow-hidden">
+    <div className="-mt-px flex h-[calc(100vh-3rem)] flex-col overflow-hidden">
       {/* Top bar */}
-      <div className="flex shrink-0 items-center justify-between border-b px-4 py-3">
+      <div className="flex shrink-0 items-center justify-between px-4 py-3">
         <div className="flex items-center gap-3">
           <Select value={selectedProjectId} onValueChange={(v) => { setSelectedProjectId(v); router.replace(`/translate?project=${v}`); }}>
             <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue /></SelectTrigger>
@@ -333,7 +431,7 @@ function TranslatePageInner() {
                       className={`mb-1 flex cursor-pointer items-center gap-3 rounded-lg border p-3 transition-colors ${
                         selectedEngine === engine.id ? "border-primary bg-primary/5" : "hover:bg-accent"
                       }`}
-                      onClick={() => setSelectedEngine(engine.id)}
+                      onClick={() => { setSelectedEngine(engine.id); setSelectedModel(""); setCustomModel(""); setModelSearch(""); }}
                     >
                       <div className={`h-3 w-3 shrink-0 rounded-full border-2 ${
                         selectedEngine === engine.id ? "border-primary bg-primary" : "border-muted-foreground/50"
@@ -359,7 +457,7 @@ function TranslatePageInner() {
                   <div className="mb-2 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-2 dark:border-amber-800 dark:bg-amber-950">
                     <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
                     <p className="text-[11px] text-amber-700 dark:text-amber-400">
-                      Free planda sistem API kullanılamaz. Kendi API anahtarınızı <button className="font-medium underline" onClick={() => router.push("/settings")}>Ayarlar</button>’dan ekleyin veya ücretli plana geçin.
+                      Free planda sistem API kullanılamaz. Kendi API anahtarınızı <button className="font-medium underline" onClick={() => router.push("/settings")}>Ayarlar</button>&apos;dan ekleyin veya ücretli plana geçin.
                     </p>
                   </div>
                 )}
@@ -371,7 +469,7 @@ function TranslatePageInner() {
                     } ${
                       selectedEngine === engine.id && !isFreePlan ? "border-primary bg-primary/5" : "hover:bg-accent"
                     }`}
-                    onClick={() => { if (!isFreePlan) setSelectedEngine(engine.id); }}
+                    onClick={() => { if (!isFreePlan) { setSelectedEngine(engine.id); setSelectedModel(""); setCustomModel(""); setModelSearch(""); } }}
                   >
                     <div className={`h-3 w-3 shrink-0 rounded-full border-2 ${
                       selectedEngine === engine.id && !isFreePlan ? "border-primary bg-primary" : "border-muted-foreground/50"
@@ -388,6 +486,88 @@ function TranslatePageInner() {
                 ))}
               </div>
             </div>
+
+            {/* MODEL SEÇİMİ */}
+            {(() => {
+              const currentEngine = ALL_ENGINES.find((e) => e.id === selectedEngine);
+              if (!currentEngine || currentEngine.models.length === 0) return null;
+              const filteredModels = currentEngine.models.filter((m) =>
+                m.label.toLowerCase().includes(modelSearch.toLowerCase()) ||
+                m.id.toLowerCase().includes(modelSearch.toLowerCase())
+              );
+              const selectedLabel = selectedModel === "_custom"
+                ? (customModel || "Özel model...")
+                : currentEngine.models.find((m) => m.id === selectedModel)?.label || "Varsayılan";
+              return (
+                <div className="space-y-2 rounded-lg border p-4">
+                  <p className="text-xs font-semibold text-muted-foreground">MODEL SEÇİMİ</p>
+                  <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button variant="outline" className="h-9 w-full justify-between text-xs font-normal">
+                        <span className="truncate">{selectedLabel}</span>
+                        <ChevronsUpDown className="ml-2 h-3 w-3 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
+                      <div className="flex items-center border-b px-3 py-2">
+                        <Search className="mr-2 h-3.5 w-3.5 shrink-0 opacity-50" />
+                        <input
+                          placeholder="Model ara..."
+                          value={modelSearch}
+                          onChange={(e) => setModelSearch(e.target.value)}
+                          className="flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                        />
+                      </div>
+                      <ScrollArea className="max-h-56">
+                        <div className="p-1">
+                          <button
+                            className={`flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent ${!selectedModel ? "bg-accent" : ""}`}
+                            onClick={() => { setSelectedModel(""); setCustomModel(""); setModelSearch(""); setModelPopoverOpen(false); }}
+                          >
+                            <Check className={`h-3 w-3 ${!selectedModel ? "opacity-100" : "opacity-0"}`} />
+                            Varsayılan
+                          </button>
+                          {filteredModels.map((m) => (
+                            <button
+                              key={m.id}
+                              className={`flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent ${selectedModel === m.id ? "bg-accent" : ""}`}
+                              onClick={() => { setSelectedModel(m.id); setCustomModel(""); setModelSearch(""); setModelPopoverOpen(false); }}
+                            >
+                              <Check className={`h-3 w-3 ${selectedModel === m.id ? "opacity-100" : "opacity-0"}`} />
+                              {m.label}
+                            </button>
+                          ))}
+                          {currentEngine.allowCustomModel && (
+                            <button
+                              className={`flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent ${selectedModel === "_custom" ? "bg-accent" : ""}`}
+                              onClick={() => { setSelectedModel("_custom"); setModelSearch(""); setModelPopoverOpen(false); }}
+                            >
+                              <Check className={`h-3 w-3 ${selectedModel === "_custom" ? "opacity-100" : "opacity-0"}`} />
+                              Özel model gir...
+                            </button>
+                          )}
+                          {filteredModels.length === 0 && !currentEngine.allowCustomModel && (
+                            <p className="px-2 py-3 text-center text-xs text-muted-foreground">Sonuç bulunamadı</p>
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </PopoverContent>
+                  </Popover>
+                  {selectedModel === "_custom" && (
+                    <input
+                      type="text"
+                      placeholder="Örn: openai/gpt-4o-mini"
+                      value={customModel}
+                      onChange={(e) => setCustomModel(e.target.value)}
+                      className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    />
+                  )}
+                  <p className="text-[10px] text-muted-foreground">
+                    Boş bırakırsanız motorun varsayılan modeli kullanılır
+                  </p>
+                </div>
+              );
+            })()}
 
             {/* GELİŞMİŞ */}
             <div className="space-y-3 rounded-lg border p-4">
@@ -412,14 +592,17 @@ function TranslatePageInner() {
         </div>
 
         {/* Right - Translation table */}
-        <div className="flex flex-1 flex-col overflow-hidden">
-          <div className="grid shrink-0 grid-cols-[40px_1fr_1fr] gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden pr-4">
+          <div
+            className="grid shrink-0 gap-3 border-b bg-muted/50 px-4 py-2 text-xs font-medium text-muted-foreground"
+            style={{ gridTemplateColumns: "40px minmax(0, 1fr) minmax(0, 1fr)" }}
+          >
             <span>#</span>
             <span>Orijinal {selectedTrack ? `(${getLangLabel(selectedTrack.language)})` : ""}</span>
             <span>Çeviri ({getLangLabel(targetLang)})</span>
           </div>
 
-          <ScrollArea className="flex-1">
+          <div className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
             {loading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
@@ -430,24 +613,29 @@ function TranslatePageInner() {
                 <p className="text-sm">Seçilen altyazı parçasında satır bulunamadı.</p>
               </div>
             ) : (
-              <div className="divide-y">
+              <div className="space-y-1 p-2">
                 {subtitles.map((sub) => (
                   <div
                     key={sub.id}
-                    className={`grid grid-cols-[40px_1fr_1fr] gap-3 px-4 py-2.5 text-sm transition-colors ${
-                      sub.is_translated ? "bg-green-500/5" : "hover:bg-accent"
+                    className={`grid min-w-0 rounded-md gap-3 px-4 py-2.5 text-sm transition-colors ${
+                      sub.is_translated ? "bg-green-500/8" : "hover:bg-accent/50"
                     }`}
+                    style={{ gridTemplateColumns: "40px minmax(0, 1fr) minmax(0, 1fr)" }}
                   >
                     <span className="font-mono text-xs text-muted-foreground">{sub.line_number}</span>
                     <div className="min-w-0 overflow-hidden">
-                      <p className="overflow-hidden text-ellipsis text-sm">{sub.original_text}</p>
+                      <div className="translate-cell-scroll min-w-0 w-full overflow-x-auto overflow-y-hidden rounded-md">
+                        <p className="inline-block min-w-full whitespace-nowrap px-1 text-sm">{sub.original_text}</p>
+                      </div>
                       <p className="font-mono text-[10px] text-muted-foreground">{sub.start_time} → {sub.end_time}</p>
                     </div>
                     <div className="flex min-w-0 items-start gap-1.5 overflow-hidden">
                       {sub.translated_text ? (
                         <>
                           <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-green-500" />
-                          <span className="overflow-hidden text-ellipsis">{sub.translated_text}</span>
+                          <div className="translate-cell-scroll min-w-0 w-full flex-1 overflow-x-auto overflow-y-hidden rounded-md">
+                            <p className="inline-block min-w-full whitespace-nowrap px-1">{sub.translated_text}</p>
+                          </div>
                         </>
                       ) : (
                         <span className="text-muted-foreground/50">—</span>
@@ -457,9 +645,10 @@ function TranslatePageInner() {
                 ))}
               </div>
             )}
-          </ScrollArea>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+

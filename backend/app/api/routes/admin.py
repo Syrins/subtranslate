@@ -102,8 +102,37 @@ def update_user(user_id: str, update: dict):
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: str):
-    """Delete a user and all their data."""
+    """Delete a user and all their data (files + DB + auth)."""
     sb = get_supabase_admin()
+    r2 = get_r2_storage()
+
+    # 1. Delete all local storage files for this user
+    try:
+        stored = sb.table("stored_files").select("storage_path").eq("user_id", user_id).execute()
+        for f in (stored.data or []):
+            try:
+                r2.delete(f["storage_path"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Delete DB records (CASCADE handles project children)
+    try:
+        sb.table("stored_files").delete().eq("user_id", user_id).execute()
+        sb.table("glossary_terms").delete().eq("user_id", user_id).execute()
+        sb.table("user_api_keys").delete().eq("user_id", user_id).execute()
+        sb.table("user_storage_configs").delete().eq("user_id", user_id).execute()
+
+        # Delete projects (CASCADE deletes subtitle_files, jobs, stored_files)
+        sb.table("projects").delete().eq("user_id", user_id).execute()
+
+        # Delete profile
+        sb.table("profiles").delete().eq("id", user_id).execute()
+    except Exception as e:
+        logger.warning("user_data_cleanup_partial", user_id=user_id, error=str(e))
+
+    # 3. Delete auth user
     try:
         sb.auth.admin.delete_user(user_id)
     except Exception as e:
