@@ -21,7 +21,8 @@ COPY . .
 RUN groupadd --system --gid 1001 appuser \
     && useradd --system --uid 1001 --gid appuser appuser \
     && mkdir -p /app/tmp /app/storage \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appuser /app \
+    && chown -R appuser:appuser /usr/local/lib/python3.12/site-packages/static_ffmpeg
 
 USER appuser
 
